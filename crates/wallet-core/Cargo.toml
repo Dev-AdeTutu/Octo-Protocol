@@ -16,6 +16,7 @@ test-fixtures = []
 
 [dependencies]
 octo-crypto.workspace = true
+chrono.workspace = true
 stellar-strkey.workspace = true
 stellar-base.workspace = true
 slip10_ed25519.workspace = true

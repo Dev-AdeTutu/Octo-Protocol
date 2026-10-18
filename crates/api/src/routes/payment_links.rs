@@ -657,11 +657,14 @@ pub async fn public_signing_info(
         }
     };
     let sequence = state.horizon().account_sequence(&account).await?;
+    let signing_policy = state.signing_policy();
+    let base_fee_stroops = crate::routes::submit::selected_signing_fee(&state).await;
     Ok(Envelope::ok(crate::routes::submit::SigningInfo {
         account,
         sequence,
         network_passphrase: state.network().passphrase().to_string(),
-        base_fee_stroops: 100,
+        base_fee_stroops,
+        max_time: signing_policy.max_time(),
     }))
 }
 
