@@ -5,8 +5,9 @@
 //!
 //! Security-relevant guarantees implemented here (see `docs/threat-model.md`):
 //! - All queries are parameterized (no string-built SQL) → no SQL injection.
-//! - [`Store::allocate_address`] increments the per-wallet muxed-id counter **atomically** inside a
-//!   transaction, so concurrent address creation can't collide or reuse an id.
+//! - [`Store::allocate_address`] / [`Store::allocate_addresses`] increment the per-wallet muxed-id
+//!   counter **atomically** inside a transaction, so concurrent address creation (single or batch)
+//!   can't collide or reuse an id, and a batch is all-or-nothing.
 //! - [`Store::record_deposit`] is **idempotent** on the immutable `(tx_hash, operation_index)`
 //!   unique index, so a replayed/reorged Horizon event cannot double-credit.
 //! - [`Store::create_withdrawal`] is idempotent on `(wallet_id, idempotency_key)`.
@@ -64,6 +65,12 @@ pub struct NewClientWallet<'a> {
     pub label: Option<&'a str>,
     pub user_id: Option<Uuid>,
     pub description: Option<&'a str>,
+}
+
+/// One address to allocate in [`Store::allocate_addresses`].
+pub struct NewAddress<'a> {
+    pub customer_ref: Option<&'a str>,
+    pub metadata: serde_json::Value,
 }
 
 /// Parameters for creating a withdrawal intent.
@@ -902,42 +909,75 @@ impl Store {
         customer_ref: Option<&str>,
         metadata: serde_json::Value,
     ) -> Result<Address, StoreError> {
+        let mut muxed_address_for = Some(muxed_address_for);
+        let mut rows = self
+            .allocate_addresses(
+                wallet_id,
+                |id| match muxed_address_for.take() {
+                    Some(derive) => derive(id),
+                    None => Err(()),
+                },
+                vec![NewAddress {
+                    customer_ref,
+                    metadata,
+                }],
+            )
+            .await?;
+        rows.pop().ok_or(StoreError::NotFound)
+    }
+
+    /// Allocate one address per entry in `new`, all-or-nothing.
+    ///
+    /// One `UPDATE ... RETURNING` reserves a contiguous block of muxed ids under the wallet's row
+    /// lock, so concurrent batches serialize and never overlap; any failed insert (e.g. a
+    /// duplicate `customer_ref`) rolls back the whole batch, counter bump included.
+    pub async fn allocate_addresses(
+        &self,
+        wallet_id: Uuid,
+        mut muxed_address_for: impl FnMut(i64) -> Result<String, ()>,
+        new: Vec<NewAddress<'_>>,
+    ) -> Result<Vec<Address>, StoreError> {
+        if new.is_empty() {
+            return Ok(Vec::new());
+        }
+        let count = i64::try_from(new.len()).map_err(|_| StoreError::NotFound)?;
         let mut tx = self.pool.begin().await?;
 
-        // Lock the wallet row and read+bump the counter.
-        let next_id: i64 =
-            sqlx::query_scalar("SELECT next_muxed_id FROM wallets WHERE id = $1 FOR UPDATE")
-                .bind(wallet_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(StoreError::NotFound)?;
-
-        sqlx::query("UPDATE wallets SET next_muxed_id = next_muxed_id + 1, updated_at = now() WHERE id = $1")
-            .bind(wallet_id)
-            .execute(&mut *tx)
-            .await?;
-
-        // Derive the muxed address for this id via the caller-provided closure (wallet-core).
-        let muxed_address = muxed_address_for(next_id).map_err(|_| StoreError::NotFound)?;
-
-        let address = sqlx::query_as::<_, Address>(
-            r#"
-            INSERT INTO addresses (wallet_id, muxed_id, muxed_address, customer_ref, metadata)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING *
-            "#,
+        // Reserve ids [first_id, first_id + count) and hold the row lock until commit.
+        let first_id: i64 = sqlx::query_scalar(
+            "UPDATE wallets SET next_muxed_id = next_muxed_id + $2, updated_at = now()
+             WHERE id = $1 RETURNING next_muxed_id - $2",
         )
         .bind(wallet_id)
-        .bind(next_id)
-        .bind(&muxed_address)
-        .bind(customer_ref)
-        .bind(metadata)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(StoreError::from_sqlx_conflict)?;
+        .bind(count)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+
+        let mut addresses = Vec::with_capacity(new.len());
+        for (muxed_id, item) in (first_id..).zip(new) {
+            // Derive the muxed address for this id via the caller-provided closure (wallet-core).
+            let muxed_address = muxed_address_for(muxed_id).map_err(|_| StoreError::NotFound)?;
+            let address = sqlx::query_as::<_, Address>(
+                r#"
+                INSERT INTO addresses (wallet_id, muxed_id, muxed_address, customer_ref, metadata)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+                "#,
+            )
+            .bind(wallet_id)
+            .bind(muxed_id)
+            .bind(&muxed_address)
+            .bind(item.customer_ref)
+            .bind(item.metadata)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(StoreError::from_sqlx_conflict)?;
+            addresses.push(address);
+        }
 
         tx.commit().await?;
-        Ok(address)
+        Ok(addresses)
     }
 
     /// List addresses for a wallet (most recent first), with optional cursor-based pagination.

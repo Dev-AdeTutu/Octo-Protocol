@@ -215,6 +215,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::addresses::create_address).get(routes::addresses::list_addresses),
         )
         .route(
+            "/v1/wallets/:id/addresses/batch",
+            post(routes::addresses::create_addresses_batch),
+        )
+        .route(
             "/v1/wallets/:id/webhooks",
             post(routes::webhooks::create_webhook).get(routes::webhooks::list_webhooks),
         )

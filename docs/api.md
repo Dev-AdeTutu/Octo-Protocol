@@ -86,6 +86,11 @@ decrypt. Consequently:
   Body: `{ "customer_ref"?: string, "metadata"?: object }`. Returns `muxed_address` (`M...`)
   **and** the `{ base_address, memo_id }` fallback. `customer_ref` (≤ 128 characters, trimmed, no
   control characters) is unique per wallet: reusing one on the same wallet is `409`.
+- `POST /v1/wallets/{id}/addresses/batch` — allocate many addresses at once. Body:
+  `{ "addresses": [{ "customer_ref"?: string, "metadata"?: object }, ...] }`, 1–100 entries.
+  All-or-nothing: if any entry fails (a bad or duplicate `customer_ref` → `400`/`409`) no address
+  is created. Each batch gets a contiguous, collision-free block of muxed ids even under
+  concurrent batches. Returns `201` with `{ data: [address, ...] }` in request order.
 - `GET  /v1/wallets/{id}/addresses` — list addresses (paginated). `?customer_ref=` returns just
   the address with that reference (an empty list if none).
 

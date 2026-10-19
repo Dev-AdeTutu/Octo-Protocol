@@ -1,4 +1,5 @@
-//! Address endpoints: generate a customer deposit address, list them with pagination.
+//! Address endpoints: generate a customer deposit address (singly or in an atomic batch), list
+//! them with pagination or look one up by `customer_ref`.
 //!
 //! Each address is returned in **both** forms — the muxed `M...` (default) and the
 //! `G...` + numeric `memo_id` fallback for senders that don't support muxed (see
@@ -13,6 +14,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
+use octo_store::NewAddress;
 use octo_wallet_core::encode_muxed;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -26,6 +28,22 @@ pub struct CreateAddressRequest {
     /// Arbitrary metadata echoed back in webhooks.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+}
+
+/// Hard cap on addresses per batch request: bounds lock hold time and per-request DB work.
+pub const MAX_BATCH_ADDRESSES: usize = 100;
+
+/// Request body for `POST /v1/wallets/{id}/addresses/batch`.
+#[derive(Debug, Default, Deserialize)]
+pub struct BatchCreateAddressRequest {
+    #[serde(default)]
+    pub addresses: Vec<CreateAddressRequest>,
+}
+
+/// Addresses created by one batch, in request order.
+#[derive(Debug, Serialize)]
+pub struct BatchAddressResponse {
+    pub data: Vec<AddressView>,
 }
 
 /// Query for `list_addresses`: pagination, or an exact `customer_ref` lookup.
@@ -124,6 +142,98 @@ pub async fn create_address(
         received_stroops: 0,
     };
     let (status, json) = Envelope::created(view);
+    Ok((status, json))
+}
+
+/// `POST /v1/wallets/{id}/addresses/batch` — allocate up to [`MAX_BATCH_ADDRESSES`] addresses
+/// atomically: either every address is created or none is.
+pub async fn create_addresses_batch(
+    State(state): State<AppState>,
+    Path(wallet_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<Envelope<BatchAddressResponse>>)> {
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
+    let req: BatchCreateAddressRequest = parse_optional(&body)?;
+    if req.addresses.is_empty() {
+        return Err(ApiError::BadRequest("addresses must contain at least one entry".into()));
+    }
+    if req.addresses.len() > MAX_BATCH_ADDRESSES {
+        return Err(ApiError::BadRequest(format!(
+            "at most {MAX_BATCH_ADDRESSES} addresses may be allocated per request"
+        )));
+    }
+
+    // Validate everything up front so a bad entry fails the batch before any id is reserved.
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::with_capacity(req.addresses.len());
+    for (i, entry) in req.addresses.into_iter().enumerate() {
+        let customer_ref = clean_optional(
+            &format!("addresses[{i}].customer_ref"),
+            entry.customer_ref.as_deref(),
+            CUSTOMER_REF_MAX,
+        )?;
+        if let Some(r) = &customer_ref {
+            if !seen.insert(r.clone()) {
+                return Err(ApiError::ConflictWith(format!(
+                    "addresses[{i}].customer_ref duplicates an earlier entry in this batch"
+                )));
+            }
+        }
+        items.push((customer_ref, entry.metadata.unwrap_or_else(|| serde_json::json!({}))));
+    }
+
+    let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.is_archived() {
+        return Err(ApiError::Forbidden("wallet is archived".into()));
+    }
+    let base = wallet.stellar_account_g.clone();
+
+    // One transaction: contiguous id block under the wallet row lock, rolled back on any failure.
+    let addresses = state
+        .store()
+        .allocate_addresses(
+            wallet_id,
+            |id| {
+                let id_u64 = u64::try_from(id).map_err(|_| ())?;
+                encode_muxed(&base, id_u64).map_err(|_| ())
+            },
+            items
+                .iter()
+                .map(|(customer_ref, metadata)| NewAddress {
+                    customer_ref: customer_ref.as_deref(),
+                    metadata: metadata.clone(),
+                })
+                .collect(),
+        )
+        .await?; // duplicate customer_ref -> 409, nothing persisted
+
+    if let Some(uid) = wallet.user_id {
+        crate::audit::record(
+            &state,
+            uid,
+            &format!("generated {} deposit addresses", addresses.len()),
+            crate::audit::category::ADDRESS,
+            Some(&wallet_id.to_string()),
+            &headers,
+        )
+        .await;
+    }
+
+    // Brand-new addresses have no deposits yet, so received_stroops is always 0.
+    let data = addresses
+        .into_iter()
+        .map(|a| AddressView {
+            id: a.id,
+            customer_ref: a.customer_ref,
+            muxed_address: a.muxed_address,
+            base_address: wallet.stellar_account_g.clone(),
+            memo_id: a.muxed_id,
+            metadata: a.metadata,
+            received_stroops: 0,
+        })
+        .collect();
+    let (status, json) = Envelope::created(BatchAddressResponse { data });
     Ok((status, json))
 }
 

@@ -163,6 +163,11 @@ fn guarded_routes() -> Vec<GuardedRoute> {
             path: |id| format!("/v1/wallets/{id}/addresses"),
         },
         GuardedRoute {
+            name: "POST /v1/wallets/:id/addresses/batch",
+            method: "POST",
+            path: |id| format!("/v1/wallets/{id}/addresses/batch"),
+        },
+        GuardedRoute {
             name: "GET /v1/wallets/:id/addresses",
             method: "GET",
             path: |id| format!("/v1/wallets/{id}/addresses"),
