@@ -330,10 +330,12 @@ fn escape(v: &str) -> String {
 }
 
 fn fmt_f64(v: f64) -> String {
-    match v {
-        f64::INFINITY => "+Inf".to_string(),
-        f64::NEG_INFINITY => "-Inf".to_string(),
-        _ => v.to_string(),
+    if v == f64::INFINITY {
+        "+Inf".to_string()
+    } else if v == f64::NEG_INFINITY {
+        "-Inf".to_string()
+    } else {
+        v.to_string()
     }
 }
 
