@@ -276,6 +276,8 @@ pub struct GasSponsorshipConfig {
     pub daily_budget_stroops: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Operation types this wallet may sponsor; `None` = the global allowlist. Can only narrow it.
+    pub allowed_operations: Option<Vec<String>>,
 }
 
 /// The withdrawal-allowlist config for a wallet (one row per wallet).

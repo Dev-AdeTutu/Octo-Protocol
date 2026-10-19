@@ -1,9 +1,10 @@
-//! Wallet endpoints: create a master wallet, fetch one, list with pagination.
+//! Wallet endpoints: create a master wallet, fetch, rename/annotate, list with pagination.
 
-use crate::auth::{authenticate, authorize_wallet};
+use crate::auth::{authenticate, authorize_wallet, authorize_wallet_scope};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
+use crate::validation::{clean_optional, WALLET_DESCRIPTION_MAX, WALLET_LABEL_MAX};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -373,8 +374,10 @@ pub async fn create_wallet(
 ) -> ApiResult<(StatusCode, Json<Envelope<CreateWalletResponse>>)> {
     let user_id = authenticate(&headers, &state).await?;
     let req: CreateWalletRequest = parse_optional(&body)?;
-    let label = req.label;
-    let description = req.description;
+    // Same limits as PATCH, so creation can't be used to slip in an oversized or spoofed label.
+    let label = clean_optional("label", req.label.as_deref(), WALLET_LABEL_MAX)?;
+    let description =
+        clean_optional("description", req.description.as_deref(), WALLET_DESCRIPTION_MAX)?;
 
     // Non-custodial: the client did the keygen; we only accept the public account.
     let public_key = req
@@ -710,6 +713,73 @@ pub async fn get_wallet(
     Ok(Envelope::ok(to_view(w)))
 }
 
+/// Body for `PATCH /v1/wallets/{id}`: omit a field to keep it, send `null` or `""` to clear it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateWalletRequest {
+    #[serde(default, deserialize_with = "crate::json::double_option::deserialize")]
+    pub label: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::json::double_option::deserialize")]
+    pub description: Option<Option<String>>,
+}
+
+/// Validate one PATCH field, keeping the absent / clear / set distinction.
+fn clean_patch_field(
+    field: &str,
+    value: Option<Option<String>>,
+    max_chars: usize,
+) -> Result<Option<Option<String>>, ApiError> {
+    value
+        .map(|v| clean_optional(field, v.as_deref(), max_chars))
+        .transpose()
+}
+
+/// `PATCH /v1/wallets/{id}` — rename or annotate a wallet. Owner login or a `write`-scoped API key.
+pub async fn update_wallet(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<WalletView>>> {
+    authorize_wallet_scope(&headers, &state, id, "write").await?;
+    let req: UpdateWalletRequest = parse_optional(&body)?;
+    if req.label.is_none() && req.description.is_none() {
+        return Err(ApiError::BadRequest(
+            "provide at least one of label, description".into(),
+        ));
+    }
+    let label = clean_patch_field("label", req.label, WALLET_LABEL_MAX)?;
+    let description = clean_patch_field("description", req.description, WALLET_DESCRIPTION_MAX)?;
+
+    let wallet = state
+        .store()
+        .update_wallet_details(
+            id,
+            label.as_ref().map(|l| l.as_deref()),
+            description.as_ref().map(|d| d.as_deref()),
+        )
+        .await?;
+
+    // Field names only in the action; target is the wallet id so caller text never enters the log.
+    if let Some(uid) = wallet.user_id {
+        let fields: Vec<&str> = [("label", label.is_some()), ("description", description.is_some())]
+            .into_iter()
+            .filter_map(|(name, changed)| changed.then_some(name))
+            .collect();
+        crate::audit::record(
+            &state,
+            uid,
+            &format!("updated wallet details ({})", fields.join(", ")),
+            crate::audit::category::WALLET,
+            Some(&wallet.id.to_string()),
+            &headers,
+        )
+        .await;
+    }
+
+    Ok(Envelope::ok(to_view(wallet)))
+}
+
 /// `GET /v1/wallets` — list the authenticated user's wallets, with optional
 /// `?limit=` and `?before=` cursor pagination.
 pub async fn list_wallets(
@@ -912,6 +982,7 @@ mod tests {
             archived_at: None,
             ingest_paused: false,
             ingest_paused_at: None,
+            ingest_streaming: false,
         };
         let responses = [
             serde_json::to_string(&CreateWalletResponse {
@@ -950,5 +1021,4 @@ mod tests {
             }
         }
     }
-}
 }
