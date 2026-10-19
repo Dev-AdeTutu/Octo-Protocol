@@ -316,6 +316,11 @@ impl WebhookSender {
             }
         };
 
+        let kind_label = match kind {
+            SendKind::Event => "event",
+            SendKind::Ping => "ping",
+        };
+        octo_metrics::WEBHOOK_DELIVERIES.inc(&[kind_label, final_status]);
         let attempts = attempts.load(Ordering::Relaxed).max(1) as i32;
         let response_code = outcome.status.map(i32::from);
         let delivery_id = self

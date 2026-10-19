@@ -36,11 +36,15 @@ lint:
 deny:
     cargo deny check
 
+# Verify every environment variable read by the code is documented in docs/env-vars.md.
+check-env-docs:
+    ./scripts/check-env-docs.sh
+
 # Local pre-push checks that work on every toolchain (clippy + deny run in CI).
 check: fmt-check test
 
 # Everything CI runs (may fail locally on source-tarball toolchains due to the clippy E0514 bug).
-ci: fmt-check lint test deny
+ci: fmt-check lint test deny check-env-docs
 
 # Start local Postgres.
 db-up:
@@ -53,6 +57,10 @@ db-down:
 # Run database migrations.
 migrate:
     sqlx migrate run --source crates/store/migrations
+
+# Lint migrations for destructive or locking statements (DROP, non-concurrent index creation, ALTER TYPE).
+lint-migrations:
+    ./scripts/lint-migrations.sh
 
 # Drop & recreate the dev database schema (destructive — local only).
 db-reset:

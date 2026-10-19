@@ -27,6 +27,28 @@ cargo deny check   # licenses + advisories (cargo install cargo-deny)
 
 All of `fmt --check`, `clippy -D warnings`, and the test suite must pass.
 
+## Pre-commit hooks
+
+The repo ships a `.pre-commit-config.yaml` that catches formatting drift and secret leaks
+before you push. Install the hooks once per clone:
+
+```bash
+pip install pre-commit   # or: brew install pre-commit / cargo install pre-commit
+pre-commit install
+```
+
+The hooks run on every commit and cover:
+
+- **rustfmt** — `cargo fmt` (formatting is applied automatically).
+- **gitleaks** — scans staged changes for accidentally committed secrets.
+- **whitespace checks** — trailing whitespace, end-of-file newline, and mixed line endings.
+
+To run all hooks against the whole tree (e.g. before opening a PR):
+
+```bash
+pre-commit run --all-files
+```
+
 ## Integration & Load Testing
 
 ### Bruno API Collection Tests
@@ -128,6 +150,14 @@ Use this instead of hitting testnet in tests so the suite stays fast and determi
   `wallet-core` and must `zeroize` on drop.
 - **Tests:** crypto and derivation code must include test vectors (e.g. SEP-0005).
 - **Migrations:** `crates/store/migrations/` is forward-only and append-only. Every PR adding a migration must also update the decision index in `docs/migrations.md` in the same PR.
+
+## Architecture Decision Records
+
+Foundational design decisions live in [`docs/adr/`](docs/adr/) as Architecture Decision Records (ADRs). Each ADR captures the context, the decision, and its consequences.
+
+- Read the existing ADRs before proposing changes to core design areas (addresses, key handling, polling, etc.).
+- New foundational decisions must be recorded as an ADR in the same PR that introduces them, using the template at [`docs/adr/template.md`](docs/adr/template.md).
+- ADRs are immutable once accepted; supersede an old ADR with a new one rather than rewriting history.
 
 ## Branching
 

@@ -6,7 +6,7 @@
 //! fall back to a per-test `wiremock` server when the axum mock is not available in this build.
 //! No shared/global mock server is used across the test binary.
 
-use octo_ingest::horizon::HorizonPayments;
+use octo_ingest::horizon::{HorizonError, HorizonPayments};
 use serde_json::json;
 use wiremock::matchers::{method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -153,6 +153,77 @@ async fn payments_after_against_axum_mock_pages_and_404() {
         .await
         .expect("404 against axum mock must not be an error");
     assert!(empty.is_empty(), "404 must yield an empty vec");
+}
+
+#[tokio::test]
+async fn payments_after_resumes_after_mid_page_outage() {
+    let server = MockServer::start().await;
+
+    // Page one: no cursor query param present. Two records; the last one's paging_token is the
+    // cursor that must be forwarded for page two.
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{ACCOUNT}/payments")))
+        .and(query_param_is_missing("cursor"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![
+            record_json("111", "111-0"),
+            record_json("222", "222-0"),
+        ])))
+        .mount(&server)
+        .await;
+
+    // Page two, first attempt: a 503 outage. `expect(1)` makes this mock match exactly once, so
+    // the retry (and any subsequent call) falls through to the success mock below.
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{ACCOUNT}/payments")))
+        .and(query_param("cursor", "222-0"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Page two, subsequent attempts: served only when the request carries cursor=222-0.
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{ACCOUNT}/payments")))
+        .and(query_param("cursor", "222-0"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(page(vec![record_json("333", "333-0")])),
+        )
+        .mount(&server)
+        .await;
+
+    let client = HorizonPayments::new(server.uri());
+
+    let page_one = client
+        .payments_after(ACCOUNT, None, 10)
+        .await
+        .expect("page one request");
+    assert_eq!(page_one.len(), 2);
+    let cursor = page_one.last().unwrap().paging_token.clone();
+    assert_eq!(cursor, "222-0");
+
+    // The outage surfaces as a request error after retries are exhausted.
+    let outage = client.payments_after(ACCOUNT, Some(&cursor), 10).await;
+    assert!(
+        matches!(outage, Err(HorizonError::Request(_))),
+        "expected HorizonError::Request after retries, got {outage:?}"
+    );
+
+    // Resuming from the same cursor succeeds and yields exactly the page-two record.
+    let page_two = client
+        .payments_after(ACCOUNT, Some(&cursor), 10)
+        .await
+        .expect("page two request after outage");
+    assert_eq!(page_two.len(), 1);
+    assert_eq!(page_two[0].id, "333");
+
+    // Union of deposits equals expected, with no duplicates across the two pages.
+    let mut ids: Vec<String> = page_one
+        .iter()
+        .chain(page_two.iter())
+        .map(|r| r.id.clone())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["111", "222", "333"]);
 }
 
 #[tokio::test]
