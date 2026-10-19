@@ -12,11 +12,13 @@
 //! - [`Store::create_withdrawal`] is idempotent on `(wallet_id, idempotency_key)`.
 #![forbid(unsafe_code)]
 
+mod account;
 mod audit_chain;
 mod config;
 mod error;
 mod models;
 
+pub use account::{AccountData, AccountDeletion, EXPORT_SECTION_LIMIT};
 pub use audit_chain::{AuditChainKey, AuditChainReport, AuditChainStatus, AUDIT_CHAIN_KEY_LEN};
 pub use config::{StoreConfig, StoreConfigError};
 pub use error::StoreError;
@@ -2392,7 +2394,9 @@ impl Store {
                   AND last_seen_at < now() - interval '60 seconds'
                 RETURNING 1
             )
-            SELECT EXISTS (SELECT 1 FROM users WHERE id = $2 AND session_epoch = $3)
+            SELECT EXISTS (
+                SELECT 1 FROM users WHERE id = $2 AND session_epoch = $3 AND deleted_at IS NULL
+            )
                AND NOT EXISTS (
                    SELECT 1 FROM token_denylist WHERE token_hash = $1 AND expires_at > now()
                )

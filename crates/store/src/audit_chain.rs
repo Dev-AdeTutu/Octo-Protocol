@@ -199,51 +199,7 @@ impl Store {
         ip_address: Option<&str>,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        // Serialize appends per user, so seq and prev_hash are assigned in one linear order.
-        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
-            .bind(LOCK_NAMESPACE)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
-
-        let (tip_seq, prev) = chain_tip(&mut tx, key, user_id).await?;
-        let seq = tip_seq + 1;
-        let id = Uuid::new_v4();
-        let created_at = now_micros();
-        let hash = row_hash(
-            key,
-            &prev,
-            &LinkFields {
-                id,
-                user_id,
-                seq,
-                action,
-                category,
-                target,
-                ip_address,
-                created_at,
-            },
-        );
-        sqlx::query(
-            "INSERT INTO audit_logs
-                 (id, user_id, action, category, target, ip_address, created_at,
-                  seq, prev_hash, row_hash)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-        )
-        .bind(id)
-        .bind(user_id)
-        .bind(action)
-        .bind(category)
-        .bind(target)
-        .bind(ip_address)
-        .bind(created_at)
-        .bind(seq)
-        .bind(prev.as_slice())
-        .bind(hash.as_slice())
-        .execute(&mut *tx)
-        .await?;
-
-        write_head(&mut tx, key, user_id, seq, &hash).await?;
+        append_link(&mut tx, key, user_id, action, category, target, ip_address).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -365,6 +321,155 @@ impl Store {
         }
         Ok(reports)
     }
+}
+
+/// Take the per-user append lock (transaction-scoped; re-entrant within one transaction).
+async fn lock_chain(tx: &mut Transaction<'_, Postgres>, user_id: Uuid) -> Result<(), StoreError> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+        .bind(LOCK_NAMESPACE)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Append one row to the user's chain inside the caller's transaction.
+pub(crate) async fn append_link(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &AuditChainKey,
+    user_id: Uuid,
+    action: &str,
+    category: &str,
+    target: Option<&str>,
+    ip_address: Option<&str>,
+) -> Result<(), StoreError> {
+    // Serialize appends per user, so seq and prev_hash are assigned in one linear order.
+    lock_chain(tx, user_id).await?;
+    let (tip_seq, prev) = chain_tip(tx, key, user_id).await?;
+    let seq = tip_seq + 1;
+    let id = Uuid::new_v4();
+    let created_at = now_micros();
+    let hash = row_hash(
+        key,
+        &prev,
+        &LinkFields {
+            id,
+            user_id,
+            seq,
+            action,
+            category,
+            target,
+            ip_address,
+            created_at,
+        },
+    );
+    sqlx::query(
+        "INSERT INTO audit_logs
+             (id, user_id, action, category, target, ip_address, created_at,
+              seq, prev_hash, row_hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(action)
+    .bind(category)
+    .bind(target)
+    .bind(ip_address)
+    .bind(created_at)
+    .bind(seq)
+    .bind(prev.as_slice())
+    .bind(hash.as_slice())
+    .execute(&mut **tx)
+    .await?;
+    write_head(tx, key, user_id, seq, &hash).await
+}
+
+/// Null `target` and `ip_address` on every row of a deleted user's chain and re-link it.
+///
+/// Each row is checked against its existing hash first, so a tampered chain is refused with
+/// [`StoreError::AuditChainCorrupt`] instead of being re-signed (which would launder the edit).
+/// Requires `users.deleted_at` to be set already: the append-only trigger checks it (0032).
+pub(crate) async fn anonymise_chain(
+    tx: &mut Transaction<'_, Postgres>,
+    key: &AuditChainKey,
+    user_id: Uuid,
+) -> Result<u64, StoreError> {
+    lock_chain(tx, user_id).await?;
+    let (tip_seq, tip_hash) = chain_tip(tx, key, user_id).await?;
+
+    let mut last_seq = 0i64;
+    let mut old_prev = GENESIS_PREV_HASH;
+    let mut new_prev = GENESIS_PREV_HASH;
+    loop {
+        let rows = sqlx::query_as::<_, ChainRow>(
+            "SELECT id, user_id, seq, prev_hash, row_hash, action, category, target,
+                    ip_address, created_at
+             FROM audit_logs
+             WHERE user_id = $1 AND seq > $2
+             ORDER BY seq
+             LIMIT $3",
+        )
+        .bind(user_id)
+        .bind(last_seq)
+        .bind(VERIFY_BATCH)
+        .fetch_all(&mut **tx)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in &rows {
+            let linked = row.prev_hash.as_deref().and_then(to_hash) == Some(old_prev);
+            if row.seq != last_seq + 1 || !linked {
+                return Err(StoreError::AuditChainCorrupt);
+            }
+            let mut fields = LinkFields {
+                id: row.id,
+                user_id: row.user_id,
+                seq: row.seq,
+                action: &row.action,
+                category: &row.category,
+                target: row.target.as_deref(),
+                ip_address: row.ip_address.as_deref(),
+                created_at: row.created_at,
+            };
+            let old_hash = row_hash(key, &old_prev, &fields);
+            if row.row_hash.as_deref().and_then(to_hash) != Some(old_hash) {
+                return Err(StoreError::AuditChainCorrupt);
+            }
+            fields.target = None;
+            fields.ip_address = None;
+            let new_hash = row_hash(key, &new_prev, &fields);
+            sqlx::query(
+                "UPDATE audit_logs SET target = NULL, ip_address = NULL, prev_hash = $2, row_hash = $3
+                 WHERE id = $1",
+            )
+            .bind(row.id)
+            .bind(new_prev.as_slice())
+            .bind(new_hash.as_slice())
+            .execute(&mut **tx)
+            .await?;
+            old_prev = old_hash;
+            new_prev = new_hash;
+            last_seq = row.seq;
+        }
+    }
+    // The walk must end exactly at the MAC-verified head, or rows were cut off the end.
+    if last_seq != tip_seq || old_prev != tip_hash {
+        return Err(StoreError::AuditChainCorrupt);
+    }
+    if last_seq > 0 {
+        write_head(tx, key, user_id, last_seq, &new_prev).await?;
+    }
+    // Stray unchained rows carry no hash to break; scrub them too.
+    let stray = sqlx::query(
+        "UPDATE audit_logs SET target = NULL, ip_address = NULL
+         WHERE user_id = $1 AND seq IS NULL AND (target IS NOT NULL OR ip_address IS NOT NULL)",
+    )
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(u64::try_from(last_seq).unwrap_or(0) + stray)
 }
 
 /// The `(seq, row_hash)` to append after. Starts a new chain (adopting pre-0026 rows) when the

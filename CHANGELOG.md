@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Account data export and deletion, each gated by password plus an emailed OTP. Deletion is
+  refused while any wallet holds funds, tombstones the user and anonymises (and re-links) the
+  retained audit chain; the export contains no secrets (#466).
 - Security: `octo-server` exits non-zero on mainnet when secrets are placeholders or low-entropy,
   or when `HORIZON_URL` / `PUBLIC_APP_URL` / `PUBLIC_API_URL` are not HTTPS (#433).
 - CI: CycloneDX SBOM (full transitive tree) uploaded on every `main` build and attached to

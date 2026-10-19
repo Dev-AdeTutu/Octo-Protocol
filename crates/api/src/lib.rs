@@ -170,6 +170,22 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/me", get(auth::me).patch(auth::update_username))
         .route("/v1/auth/logout", post(auth::logout))
         .route("/v1/auth/change-password", post(auth::change_password))
+        // Account export/deletion: password + emailed OTP; under /v1/auth/ so responses are no-store.
+        .route(
+            "/v1/auth/account/export/request-otp",
+            post(routes::account::export_request_otp),
+        )
+        .route("/v1/auth/account/export", post(routes::account::export_account))
+        .route(
+            "/v1/auth/account/delete/request-otp",
+            post(routes::account::delete_request_otp)
+                .layer(middleware::from_fn(outbound_route_timeout)),
+        )
+        .route(
+            "/v1/auth/account/delete",
+            post(routes::account::delete_account)
+                .layer(middleware::from_fn(outbound_route_timeout)),
+        )
         .route("/v1/auth/sessions", get(routes::sessions::list_sessions))
         // Static segment takes priority over the :id capture below (matchit routing).
         .route(
