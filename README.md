@@ -84,8 +84,8 @@ docker compose --profile mock-horizon up
 # 1. Tooling: Rust 1.84.1 (pinned via rust-toolchain.toml), Docker, just
 cp .env.example .env                 # then fill MASTER_KEY (openssl rand -base64 32)
 
-# 2. Local Postgres only
-docker compose up -d db
+# 2. Local Postgres
+just db-up          # docker compose up -d db
 
 # 3. Build & test
 just build
@@ -94,6 +94,14 @@ just test
 # 4. Run the service (REST API + deposit ingest worker)
 just run            # cargo run -p octo-server  → API on $BIND_ADDR (default :8080)
 ```
+
+Other handy recipes (see `just --list`): `just migrate` applies migrations, `just db-reset`
+drops and recreates the local database, and `just seed` loads idempotent demo data (a verified
+user, wallets and sample deposit history). `just seed` refuses to run against mainnet configs.
+
+For offline development and tests, a small mock Horizon server serves scripted accounts,
+payments and submit responses — no network or testnet required. See
+[docs/mock-horizon.md](docs/mock-horizon.md) for fixtures and how to point the server at it.
 
 ### Configuration
 
@@ -264,11 +272,15 @@ open public issues for security reports.
 - [Operational Runbook: Operation Index Backfill](docs/runbook-backfill-operation-index.md)
 - [Backfill Constraint Safety Analysis](docs/backfill-constraint-analysis.md)
 - [REST API Specification](docs/api.md)
+- [Production Deployment Guide](docs/deployment.md)
+- [Mock Horizon Server & Fixtures](docs/mock-horizon.md)
 
 ## Deployment
 
 `octo-server` runs the REST API and the deposit ingest worker in one process and is safe to
-roll (Kubernetes, ECS, systemd) behind a load balancer.
+roll (Kubernetes, ECS, systemd) behind a load balancer. For TLS termination, proxy headers,
+trusted proxies, secrets, Postgres and single- vs multi-instance caveats, see the
+**[Production Deployment Guide](docs/deployment.md)**.
 
 ### Container image
 
