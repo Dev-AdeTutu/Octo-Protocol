@@ -16,6 +16,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use octo_wallet_core::compute_inner_tx_hash;
 use serde::{Deserialize, Serialize};
+use crate::signing_policy::MIN_BASE_FEE_STROOPS;
 use uuid::Uuid;
 
 /// Withdrawal-OTP TTL. Matches the signup OTP's 10-minute window.
@@ -425,12 +426,27 @@ pub async fn signing_info(
             other => other,
         })?;
 
+    let fee_policy = state.signing_policy();
+    let base_fee_stroops = selected_signing_fee(&state).await;
     Ok(Envelope::ok(SigningInfo {
         account: wallet.stellar_account_g,
         sequence,
         network_passphrase: state.network().passphrase().to_string(),
-        base_fee_stroops: 100,
+        base_fee_stroops,
+        max_time: fee_policy.max_time(),
     }))
+}
+
+pub(crate) async fn selected_signing_fee(state: &AppState) -> i64 {
+    let policy = state.signing_policy();
+    state
+        .horizon()
+        .recommended_fee_stroops(
+            policy.fee_percentile(),
+            MIN_BASE_FEE_STROOPS,
+            policy.fee_ceiling_stroops(),
+        )
+        .await
 }
 
 #[derive(Debug, Serialize)]
@@ -449,7 +465,10 @@ pub struct SigningInfo {
     #[serde(with = "crate::json::i64_as_string")]
     pub sequence: i64,
     pub network_passphrase: String,
+    /// Selected per-operation fee in stroops, bounded by the configured ceiling.
     pub base_fee_stroops: i64,
+    /// Absolute UNIX timestamp in seconds for the transaction time-bound `max_time`.
+    pub max_time: u64,
 }
 
 const WITHDRAW_CONFIRM_RATE_LIMIT_THRESHOLD: u32 = 10;

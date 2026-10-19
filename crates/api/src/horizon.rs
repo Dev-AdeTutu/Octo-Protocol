@@ -22,6 +22,7 @@
 use crate::error::ApiError;
 use octo_resilience::{execute, CallKind, CircuitBreaker, ResilienceError, RetryPolicy};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Timeout for balance/sequence reads and friendbot funding — these are simple GETs against a
@@ -32,6 +33,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// the connection while the tx is validated/applied), so it gets a longer per-request override
 /// instead of raising the client's default for every call.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Fee suggestions must not stall signing-info requests when Horizon's auxiliary endpoint is slow.
+const FEE_STATS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A single balance line from a Horizon account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +61,12 @@ struct AccountResponse {
     num_sponsoring: i64,
     #[serde(default)]
     num_sponsored: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeeStatsResponse {
+    #[serde(default)]
+    fee_charged: HashMap<String, serde_json::Value>,
 }
 
 /// Everything the withdrawal pre-flight checks need about the source account, fetched in a
@@ -357,6 +366,45 @@ impl Horizon {
             Err(ResilienceError::Exhausted(FetchError::NotFound)) => Err(ApiError::NotFound),
             Err(ResilienceError::Exhausted(_)) => Err(ApiError::Internal),
         }
+    }
+
+    /// Choose a per-operation fee from Horizon's configured percentile, bounded by `ceiling`.
+    /// Missing, malformed, or unavailable fee stats fall back to the network base fee.
+    pub async fn recommended_fee_stroops(
+        &self,
+        percentile: u8,
+        base_fee_stroops: i64,
+        ceiling_stroops: i64,
+    ) -> i64 {
+        debug_assert!(ceiling_stroops >= base_fee_stroops);
+        let fee = self
+            .fee_stats_percentile(percentile)
+            .await
+            .filter(|fee| *fee > 0)
+            .unwrap_or(base_fee_stroops)
+            .max(base_fee_stroops);
+        fee.min(ceiling_stroops)
+    }
+
+    async fn fee_stats_percentile(&self, percentile: u8) -> Option<i64> {
+        let key = format!("p{percentile}");
+        let url = format!("{}/fee_stats", self.base_url.trim_end_matches('/'));
+        let http = self.http.clone();
+        tokio::time::timeout(FEE_STATS_TIMEOUT, async move {
+            let response = http.get(url).send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            let stats: FeeStatsResponse = response.json().await.ok()?;
+            let value = stats.fee_charged.get(&key)?;
+            value
+                .as_str()
+                .and_then(|raw| raw.parse::<i64>().ok())
+                .or_else(|| value.as_i64())
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Submit a signed transaction (base64 XDR envelope) to Horizon.

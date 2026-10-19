@@ -68,13 +68,23 @@ decrypt. Consequently:
 
 ## Moving funds (the non-custodial path)
 
-1. `GET  /v1/wallets/{id}/signing-info` — returns the account `sequence`, the network
-   passphrase, and the base fee, so you can build a transaction without talking to Horizon.
-2. Build and **sign locally**.
+1. `GET  /v1/wallets/{id}/signing-info` — returns the account `sequence`, network passphrase,
+   selected per-operation `base_fee_stroops`, and absolute Unix `max_time`. The fee is selected
+   from the configured Horizon `/fee_stats` percentile and never exceeds the configured ceiling;
+   when fee stats are unavailable it falls back to the Stellar base fee.
+2. Build and **sign locally**, including a time bound whose `max_time` is the returned value. The
+   envelope will then expire after the configured short window rather than remaining submit-able
+   indefinitely.
 3. `POST /v1/wallets/{id}/submit-signed` — body `{ "transaction_xdr": "<base64>" }`.
    The server validates (v1 envelope, at least one signature, source account == this wallet,
    operation-type allowlist) and relays it **unmodified**. On failure it returns Horizon's
    result codes (`tx_bad_seq`, `op_no_trust`, …) so you can correct and re-sign.
+
+`POST /v1/wallets/{id}/trustlines` and public payment-link signing info return the same fee and
+`max_time` guidance. The server defaults to a five-minute lifetime, fee percentile 50, and a
+10,000-stroop per-operation ceiling. Configure these with `STELLAR_TX_MAX_AGE_SECS`
+(1–86400), `STELLAR_FEE_PERCENTILE` (10, 20, 30, 40, 50, 60, 70, 80, 90, 95, or 99), and
+`STELLAR_FEE_CEILING_STROOPS` (at least 100).
 
 ## Addresses
 

@@ -12,7 +12,7 @@ mod mainnet_guard;
 
 use anyhow::{Context, Result};
 use octo_api::rate_limit::{RateLimitBackend, RateLimiter};
-use octo_api::{build_router, AppState};
+use octo_api::{build_router, AppState, SigningPolicy};
 use octo_email::EmailSender;
 use octo_ingest::Supervisor;
 use octo_resilience::ResilienceConfig;
@@ -115,6 +115,7 @@ async fn serve(cfg: Config) -> Result<()> {
         resilience.retry_policy(),
         resilience.circuit_breaker(),
     )
+    .with_signing_policy(cfg.signing_policy)
     .with_jwt_secret(cfg.jwt_secret.clone())
     .with_audit_chain_key(cfg.audit_chain_key.clone())
     .with_public_api_url(cfg.public_api_url.as_deref())
@@ -405,6 +406,7 @@ struct Config {
     rate_limit_backend: RateLimitBackend,
     network: StellarNetwork,
     horizon_url: String,
+    signing_policy: SigningPolicy,
     friendbot_url: Option<String>,
     /// Base URL of the hosted checkout frontend (e.g. `https://app.octo.dev`), used to build the
     /// `url` field on payment-link responses. Defaults to the local frontend dev server.
@@ -454,6 +456,7 @@ impl fmt::Debug for Config {
             .field("database_url", &"[REDACTED]")
             .field("network", &self.network)
             .field("horizon_url", &self.horizon_url)
+            .field("signing_policy", &self.signing_policy)
             .field("friendbot_url", &self.friendbot_url)
             .field("public_app_url", &self.public_app_url)
             .field("public_api_url", &self.public_api_url)
@@ -472,6 +475,20 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
+    fn parse_env_or<T>(name: &str, default: T) -> Result<T>
+    where
+        T: std::str::FromStr,
+        T::Err: fmt::Display,
+    {
+        match std::env::var(name) {
+            Ok(raw) => raw
+                .parse()
+                .with_context(|| format!("{name} must be a valid number (got {raw:?})")),
+            Err(std::env::VarError::NotPresent) => Ok(default),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Reject placeholder/low-entropy secrets and plaintext URLs when running on mainnet.
     fn ensure_safe_for_network(&self) -> Result<(), mainnet_guard::UnsafeMainnetConfig> {
         mainnet_guard::check(
@@ -506,6 +523,12 @@ impl Config {
 
         let horizon_url = std::env::var("HORIZON_URL")
             .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
+        let signing_policy = SigningPolicy::new(
+            Self::parse_env_or("STELLAR_TX_MAX_AGE_SECS", 300_u64)?,
+            Self::parse_env_or("STELLAR_FEE_PERCENTILE", 50_u8)?,
+            Self::parse_env_or("STELLAR_FEE_CEILING_STROOPS", 10_000_i64)?,
+        )
+        .map_err(anyhow::Error::msg)?;
         let friendbot_url = std::env::var("FRIENDBOT_URL").ok();
 
         let public_app_url = std::env::var("PUBLIC_APP_URL")
@@ -574,6 +597,7 @@ impl Config {
             rate_limit_backend,
             network,
             horizon_url,
+            signing_policy,
             friendbot_url,
             public_app_url,
             public_api_url,
