@@ -27,6 +27,28 @@ cargo deny check   # licenses + advisories (cargo install cargo-deny)
 
 All of `fmt --check`, `clippy -D warnings`, and the test suite must pass.
 
+## Pre-commit hooks
+
+The repo ships a `.pre-commit-config.yaml` that catches formatting drift and secret leaks
+before you push. Install the hooks once per clone:
+
+```bash
+pip install pre-commit   # or: brew install pre-commit / cargo install pre-commit
+pre-commit install
+```
+
+The hooks run on every commit and cover:
+
+- **rustfmt** — `cargo fmt` (formatting is applied automatically).
+- **gitleaks** — scans staged changes for accidentally committed secrets.
+- **whitespace checks** — trailing whitespace, end-of-file newline, and mixed line endings.
+
+To run all hooks against the whole tree (e.g. before opening a PR):
+
+```bash
+pre-commit run --all-files
+```
+
 ## Integration & Load Testing
 
 ### Bruno API Collection Tests

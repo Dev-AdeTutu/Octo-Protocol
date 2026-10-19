@@ -54,6 +54,10 @@ db-down:
 migrate:
     sqlx migrate run --source crates/store/migrations
 
+# Lint migrations for destructive or locking statements (DROP, non-concurrent index creation, ALTER TYPE).
+lint-migrations:
+    ./scripts/lint-migrations.sh
+
 # Drop & recreate the dev database schema (destructive — local only).
 db-reset:
     docker exec -i octo-db psql -U octo -d octo -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
