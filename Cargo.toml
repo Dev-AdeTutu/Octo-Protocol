@@ -11,6 +11,7 @@ members = [
     "crates/resilience",
     "crates/evm-core",
     "crates/evm-rpc",
+    "crates/metrics",
     "bin/server",
     "bin/migrate-keys",
     "bin/backfill-operation-index",
@@ -93,6 +94,7 @@ octo-api = { path = "crates/api" }
 octo-resilience = { path = "crates/resilience" }
 octo-evm-core = { path = "crates/evm-core" }
 octo-evm-rpc = { path = "crates/evm-rpc" }
+octo-metrics = { path = "crates/metrics" }
 
 [profile.release]
 lto = "thin"

@@ -1,5 +1,6 @@
 //! HTTP route handlers.
 
+pub mod account;
 pub mod addresses;
 pub mod apikeys;
 pub mod audit;

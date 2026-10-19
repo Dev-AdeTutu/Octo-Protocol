@@ -239,12 +239,16 @@ impl Horizon {
             account_g
         );
         let http = self.http.clone();
+        // Captured here, inside the instrumented span, so retries share one parent context.
+        let trace = trace_headers();
         let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
             let url = url.clone();
             let http = http.clone();
+            let trace = trace.clone();
             async move {
                 let resp = http
                     .get(&url)
+                    .headers(trace)
                     .send()
                     .await
                     .map_err(|_| FetchError::Transport)?;
@@ -313,13 +317,17 @@ impl Horizon {
             account_g
         );
         let http = self.http.clone();
+        // Captured here, inside the instrumented span, so retries share one parent context.
+        let trace = trace_headers();
 
         let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
             let url = url.clone();
             let http = http.clone();
+            let trace = trace.clone();
             async move {
                 let resp = http
                     .get(&url)
+                    .headers(trace)
                     .send()
                     .await
                     .map_err(|_| FetchError::Transport)?;
@@ -429,15 +437,19 @@ impl Horizon {
         let span = tracing::Span::current();
         let url = format!("{}/transactions", self.base_url.trim_end_matches('/'));
         let http = self.http.clone();
+        // Captured here, inside the instrumented span, so retries share one parent context.
+        let trace = trace_headers();
         let xdr = envelope_xdr.to_string();
 
         let result = execute(&self.circuit, &self.retry, CallKind::Submit, || {
             let url = url.clone();
             let http = http.clone();
+            let trace = trace.clone();
             let xdr = xdr.clone();
             async move {
                 let resp = http
                     .post(&url)
+                    .headers(trace)
                     .form(&[("tx", &xdr)])
                     .timeout(SUBMIT_TIMEOUT)
                     .send()
@@ -505,6 +517,7 @@ impl Horizon {
         let resp = self
             .http
             .get(url)
+            .headers(trace_headers())
             .timeout(Duration::from_secs(3))
             .send()
             .await
@@ -515,6 +528,17 @@ impl Horizon {
             Err(format!("horizon returned HTTP {}", resp.status()))
         }
     }
+}
+
+/// Trace-context headers for the current span; empty unless trace export is enabled.
+fn trace_headers() -> reqwest::header::HeaderMap {
+    octo_resilience::trace_headers()
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).ok()?;
+            Some((name, reqwest::header::HeaderValue::from_str(&v).ok()?))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -143,6 +143,8 @@ pub struct User {
     pub session_epoch: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Set when the account was deleted; the row is then a scrubbed tombstone (migration 0032).
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 /// A registered webhook endpoint.

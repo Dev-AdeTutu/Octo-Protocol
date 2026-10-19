@@ -1855,6 +1855,7 @@ dependencies = [
  "octo-crypto",
  "octo-email",
  "octo-ingest",
+ "octo-metrics",
  "octo-resilience",
  "octo-store",
  "octo-wallet-core",
@@ -1946,6 +1947,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "dotenvy",
+ "octo-metrics",
  "octo-resilience",
  "octo-store",
  "octo-wallet-core",
@@ -1983,6 +1985,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "octo-metrics"
+version = "0.1.0"
+
+[[package]]
 name = "octo-resilience"
 version = "0.1.0"
 dependencies = [
@@ -2000,10 +2006,13 @@ dependencies = [
  "octo-api",
  "octo-email",
  "octo-ingest",
+ "octo-metrics",
  "octo-resilience",
  "octo-store",
  "octo-wallet-core",
  "octo-webhooks",
+ "reqwest",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2060,6 +2069,7 @@ dependencies = [
  "dotenvy",
  "hex",
  "hmac",
+ "octo-metrics",
  "octo-resilience",
  "octo-store",
  "reqwest",

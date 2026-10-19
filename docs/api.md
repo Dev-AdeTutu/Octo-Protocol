@@ -40,6 +40,32 @@ authenticated request checks the deny-list, the session, and the user's session 
 
 Session endpoints require a dashboard JWT (API keys get `401`).
 
+### Account export and deletion
+
+Both flows require a dashboard JWT **plus** the current password **plus** an emailed one-time
+code. Export and delete codes are separate purposes, so one can never be redeemed for the other.
+All four calls share a cap of 5 per user per hour (`429` beyond that).
+
+- `POST /v1/auth/account/export/request-otp` — body `{ "password" }`; emails a code.
+- `POST /v1/auth/account/export` — body `{ "password", "code" }`; returns the caller's profile,
+  wallets, addresses, transactions, withdrawals, sponsored transactions, API keys (prefix and
+  scopes only), webhook endpoints (no secret), allowlist, payment links and payments, sessions
+  and audit log. **No secrets**: password hash, sealed seeds, the encrypted backup blob, webhook
+  secrets and API key hashes are never included. Each section holds at most `section_limit`
+  rows; cut-off sections are named in `truncated`. Every export writes an audit row, and the
+  request fails rather than export untraced.
+- `POST /v1/auth/account/delete/request-otp` — body `{ "password" }`; emails a code, or `409`
+  if any wallet still holds funds.
+- `POST /v1/auth/account/delete` — body `{ "password", "code" }`; deletes the account.
+
+**Deletion is refused (`409`) while any wallet's Stellar account or gas tank holds a non-zero
+balance** — withdraw or merge them first. If Horizon can't confirm the balances the request
+fails closed with `503`. On success the user row becomes a tombstone (email, username and
+password hash scrubbed), every session and API key is revoked, wallets are archived with their
+label, description and backup removed, webhooks and payment links are retired, payer details
+are erased, and the audit trail is kept but anonymised (see [audit-log.md](audit-log.md)).
+Transactions and withdrawals are retained as financial records.
+
 ## Custody model — read this before the wallet endpoints
 
 octo is **non-custodial**. The wallet's private key is generated and held **client-side**; the
