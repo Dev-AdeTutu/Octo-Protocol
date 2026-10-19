@@ -76,6 +76,29 @@ decrypt. Consequently:
    operation-type allowlist) and relays it **unmodified**. On failure it returns Horizon's
    result codes (`tx_bad_seq`, `op_no_trust`, …) so you can correct and re-sign.
 
+### Withdrawal estimate
+
+`GET /v1/wallets/{id}/withdraw/estimate` — preview a withdrawal's fee and minimum-balance impact
+before building it. Query: `asset_code` + `asset_issuer` (omit both for XLM), optional
+`amount_stroops`, optional `operations` (1–100, default 1). Returns:
+
+| Field | Meaning |
+|---|---|
+| `base_fee_stroops` | Network minimum per operation (Horizon `last_ledger_base_fee`) |
+| `recommended_fee_stroops` | Per-op bid: `max(base_fee, fee_charged.p90)` |
+| `estimated_fee_stroops` | `recommended_fee_stroops × operations` — the tx `fee` to build with |
+| `base_reserve_stroops`, `min_reserve_stroops` | `base_reserve × (2 + subentries + sponsoring − sponsored)` |
+| `native_balance_stroops`, `asset_balance_stroops` | Current balances (`asset_balance` only for credit assets) |
+| `fee_covered` | Native balance above the reserve covers the fee |
+| `max_withdrawable_stroops` | Most of the asset that can leave after fee and reserve |
+| `sufficient` | Only when `amount_stroops` is given: fee covered and amount ≤ max |
+
+The reserve figures come from the same `AccountInfo` read and `BASE_RESERVE_STROOPS` constant the
+withdrawal pre-flight uses. Fee stats are cached in-process for 10 seconds (`FEE_STATS_TTL`) and
+shared by all requests; a failed fetch is never cached. The estimate ignores selling liabilities
+from open offers (the relay's op allowlist doesn't create them). Unfunded wallet or missing
+trustline → `400`.
+
 ## Addresses
 
 - `POST /v1/wallets/{id}/addresses` — generate a dedicated customer address.

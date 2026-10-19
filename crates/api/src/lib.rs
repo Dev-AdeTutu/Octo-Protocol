@@ -15,6 +15,7 @@ pub mod self_test;
 pub mod sponsor_validation;
 mod state;
 pub mod submit_validation;
+pub mod withdrawal_estimate;
 
 pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
@@ -259,6 +260,11 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/wallets/:id/withdraw/confirm",
             post(routes::submit::withdraw_confirm),
+        )
+        .route(
+            "/v1/wallets/:id/withdraw/estimate",
+            get(routes::submit::withdraw_estimate)
+                .layer(middleware::from_fn(outbound_route_timeout)),
         )
         .route(
             "/v1/wallets/:id/signing-info",
