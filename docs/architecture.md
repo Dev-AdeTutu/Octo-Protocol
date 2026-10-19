@@ -164,3 +164,99 @@ The server talks to Postgres through `octo-store`. In production it should conne
 least-privilege runtime role (`octo_app`, `RUN_MIGRATIONS=false`) while a separate migrator role
 applies migrations with `octo-server --migrate-only`. Roles, exact grants and the runbook:
 [postgres-roles.md](postgres-roles.md).
+
+---
+
+## Diagrams
+
+The diagrams below are Mermaid and render directly on GitHub. They describe the current code in
+`crates/api`, `crates/ingest`, `crates/wallet-core` and `crates/webhooks`; if a diagram and the
+code disagree, the code is authoritative and the diagram should be fixed in the same PR.
+
+### Request flow through the axum API
+
+```mermaid
+flowchart TD
+    Client[Client] -->|HTTP request| Router[axum Router]
+    Router --> MW[Middleware: tracing, request id, auth]
+    MW -->|unauthenticated| Reject[401 / 403 response]
+    MW --> Handler[Route handler in crates/api]
+    Handler --> Validate[Validate path, query and JSON body]
+    Validate -->|invalid| BadReq[400 response]
+    Validate --> Store[octo-store: Postgres query]
+    Store --> Handler
+    Handler -->|success| Ok[2xx JSON response]
+    Handler -->|error| Err[Error mapped to status code]
+    Ok --> Client
+    Err --> Client
+    Reject --> Client
+    BadReq --> Client
+```
+
+### Ingest pipeline
+
+```mermaid
+flowchart TD
+    Poll[Horizon poller in crates/ingest] -->|GET transactions / operations| Horizon[(Stellar Horizon)]
+    Horizon --> Parse[Parse into ingest records]
+    Parse --> Dedup{Already seen?<br/>dedup key in octo-store}
+    Dedup -->|yes| Skip[Skip record]
+    Dedup -->|no| Record[Record deposit / event in octo-store]
+    Record --> Enqueue[Enqueue webhook delivery]
+    Enqueue --> Done[Advance cursor]
+    Skip --> Done
+    Done --> Poll
+```
+
+### Signing and submit-signed relay
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as octo-server (crates/api)
+    participant WC as wallet-core
+    participant H as Stellar Horizon
+
+    C->>API: POST /transactions (unsigned envelope / intent)
+    API->>WC: Build transaction (sequence, fee, network passphrase)
+    WC-->>API: Unsigned XDR
+    API-->>C: Unsigned XDR to sign
+    C->>C: Sign XDR with client-held key
+    C->>API: POST /transactions/submit-signed (signed XDR)
+    API->>API: Validate signature and envelope
+    API->>H: Submit signed transaction
+    H-->>API: Result (hash / error)
+    API-->>C: Submission result
+```
+
+The server never holds the client's signing key: it builds the envelope, the client signs it, and
+the server only relays the already-signed envelope to Horizon.
+
+### Webhook delivery
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant I as Ingest (crates/ingest)
+    participant W as Webhooks (crates/webhooks)
+    participant DB as octo-store
+    participant R as Receiver endpoint
+
+    I->>W: Enqueue event
+    W->>DB: Persist delivery (pending, attempt count)
+    loop Until delivered or attempts exhausted
+        W->>W: Serialise payload, compute HMAC signature
+        W->>R: POST payload with signature header
+        alt 2xx response
+            R-->>W: 2xx
+            W->>DB: Mark delivered
+        else non-2xx or timeout
+            R-->>W: Error / timeout
+            W->>DB: Record failed attempt, schedule retry with backoff
+        end
+    end
+```
+
+Receivers verify the HMAC signature over the raw request body before trusting the payload; the
+signing secret is shared out of band and never sent over the wire.

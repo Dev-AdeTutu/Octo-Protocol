@@ -14,6 +14,7 @@ members = [
     "crates/resilience",
     "crates/evm-core",
     "crates/evm-rpc",
+    "crates/metrics",
     "bin/server",
     "bin/migrate-keys",
     "bin/backfill-operation-index",
@@ -83,6 +84,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # rand::rngs::OsRng is the CSPRNG for seed entropy, nonces and salts — a bump must keep it OS-backed.
 rand = "0.8"
 proptest = "1"
+wiremock = "=0.6.2"
 
 # --- internal crates ---
 octo-crypto = { path = "crates/crypto" }
@@ -95,6 +97,7 @@ octo-api = { path = "crates/api" }
 octo-resilience = { path = "crates/resilience" }
 octo-evm-core = { path = "crates/evm-core" }
 octo-evm-rpc = { path = "crates/evm-rpc" }
+octo-metrics = { path = "crates/metrics" }
 
 [profile.release]
 lto = "thin"

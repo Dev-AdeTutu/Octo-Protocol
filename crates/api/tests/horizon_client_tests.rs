@@ -129,3 +129,31 @@ async fn submit_transaction_200_with_unparseable_body_maps_to_internal() {
         res
     );
 }
+
+#[tokio::test]
+async fn fee_stats_selected_fee_never_exceeds_configured_ceiling() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fee_stats"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "fee_charged": { "p95": "2500" }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let client = Horizon::new(mock_server.uri());
+    assert_eq!(client.recommended_fee_stroops(95, 100, 1_000).await, 1_000);
+}
+
+#[tokio::test]
+async fn fee_stats_unavailable_falls_back_to_network_base_fee() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fee_stats"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock_server)
+        .await;
+
+    let client = Horizon::new(mock_server.uri());
+    assert_eq!(client.recommended_fee_stroops(50, 100, 1_000).await, 100);
+}

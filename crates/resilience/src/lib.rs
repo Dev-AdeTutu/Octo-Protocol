@@ -36,10 +36,31 @@
 //! clearly down), but the retry policy explicitly does not.
 #![forbid(unsafe_code)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::warn;
+
+// ---------------------------------------------------------------------------
+// Trace-context propagation
+// ---------------------------------------------------------------------------
+
+/// Produces trace-context headers (W3C `traceparent` / `tracestate`) for the current span.
+pub type TraceInjector = fn() -> Vec<(String, String)>;
+
+static TRACE_INJECTOR: OnceLock<TraceInjector> = OnceLock::new();
+
+/// Install the process-wide injector used by every Horizon client (issue #468). Set once by the
+/// binary when trace export is enabled; returns `false` if one was already installed.
+pub fn set_trace_injector(injector: TraceInjector) -> bool {
+    TRACE_INJECTOR.set(injector).is_ok()
+}
+
+/// Headers to attach to an outbound call so the callee joins the current trace. Empty (and free)
+/// unless an injector is installed. Carries trace ids only — never baggage or span attributes.
+pub fn trace_headers() -> Vec<(String, String)> {
+    TRACE_INJECTOR.get().map(|inject| inject()).unwrap_or_default()
+}
 
 // ---------------------------------------------------------------------------
 // Configuration

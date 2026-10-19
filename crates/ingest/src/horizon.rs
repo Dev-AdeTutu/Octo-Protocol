@@ -164,12 +164,15 @@ impl HorizonPayments {
         }
 
         let http = self.http.clone();
+        let trace = trace_headers();
         let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
             let url = url.clone();
             let http = http.clone();
+            let trace = trace.clone();
             async move {
                 let resp = http
                     .get(&url)
+                    .headers(trace)
                     .send()
                     .await
                     .map_err(|_| IngestFetchError::Transport)?;
@@ -236,6 +239,17 @@ impl std::fmt::Display for IngestFetchError {
             Self::Permanent => write!(f, "permanent error"),
         }
     }
+}
+
+/// Trace-context headers for the current span; empty unless trace export is enabled.
+fn trace_headers() -> reqwest::header::HeaderMap {
+    octo_resilience::trace_headers()
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).ok()?;
+            Some((name, reqwest::header::HeaderValue::from_str(&v).ok()?))
+        })
+        .collect()
 }
 
 #[cfg(test)]
