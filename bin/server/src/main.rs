@@ -197,6 +197,13 @@ async fn serve(cfg: Config) -> Result<()> {
         }
     });
 
+    // Settle withdrawals left pending by a crash or an ambiguous Horizon submit.
+    tokio::spawn(octo_api::withdrawal_reconciler::run(
+        store.clone(),
+        state.horizon().clone(),
+        Default::default(),
+    ));
+
     // Hourly prune of expired deny-list entries and sessions, so neither table grows unbounded.
     let purge_store = store.clone();
     tokio::spawn(async move {

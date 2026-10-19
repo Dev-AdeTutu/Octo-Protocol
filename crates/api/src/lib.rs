@@ -15,6 +15,7 @@ pub mod self_test;
 pub mod sponsor_validation;
 mod state;
 pub mod submit_validation;
+pub mod withdrawal_reconciler;
 
 pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
