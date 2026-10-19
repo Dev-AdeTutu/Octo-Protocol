@@ -104,6 +104,9 @@ async fn serve(cfg: Config) -> Result<()> {
 
     // Shared state (includes the API's Horizon client wired with resilience).
     let email = EmailSender::new(cfg.resend_api_key.clone(), cfg.email_from_address.clone());
+    // One breaker per client; clones share state, so `/metrics` reads the live one.
+    let api_circuit = resilience.circuit_breaker();
+    register_breaker_gauge("horizon_api", api_circuit.clone());
     let mut state = AppState::new_with_resilience(
         store.clone(),
         cfg.master_key,
@@ -113,7 +116,7 @@ async fn serve(cfg: Config) -> Result<()> {
         cfg.public_app_url.clone(),
         email,
         resilience.retry_policy(),
-        resilience.circuit_breaker(),
+        api_circuit,
     )
     .with_jwt_secret(cfg.jwt_secret.clone())
     .with_audit_chain_key(cfg.audit_chain_key.clone())
@@ -140,6 +143,7 @@ async fn serve(cfg: Config) -> Result<()> {
     // independently).
     let ingest_retry = cfg.resilience.retry_policy();
     let ingest_circuit = cfg.resilience.circuit_breaker();
+    register_breaker_gauge("horizon_ingest", ingest_circuit.clone());
     let supervisor = Supervisor::new_with_resilience(
         store.clone(),
         cfg.horizon_url.clone(),
@@ -212,6 +216,27 @@ async fn serve(cfg: Config) -> Result<()> {
         }
     });
 
+    // Metrics get their own listener, so `/metrics` is never reachable via the public API port.
+    if let Some(metrics) = cfg.metrics.clone() {
+        let listener = tokio::net::TcpListener::bind(&metrics.bind_addr)
+            .await
+            .with_context(|| format!("bind metrics listener {}", metrics.bind_addr))?;
+        tracing::info!(
+            addr = %metrics.bind_addr,
+            token_required = metrics.token.is_some(),
+            "metrics listening"
+        );
+        let metrics_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let served = axum::serve(listener, metrics_router(metrics.token))
+                .with_graceful_shutdown(metrics_shutdown.cancelled_owned())
+                .await;
+            if let Err(e) = served {
+                tracing::error!(error = ?e, "metrics listener failed");
+            }
+        });
+    }
+
     // REST API.
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr)
@@ -274,6 +299,55 @@ async fn serve(cfg: Config) -> Result<()> {
     }
     tracing::info!("exiting");
     Ok(())
+}
+
+/// Expose a breaker as `octo_circuit_breaker_state{breaker}`: 0 closed, 1 half-open, 2 open.
+fn register_breaker_gauge(breaker: &'static str, circuit: octo_resilience::CircuitBreaker) {
+    octo_metrics::register_gauge_fn(
+        "octo_circuit_breaker_state",
+        "Circuit breaker state: 0 closed, 1 half-open, 2 open.",
+        &[("breaker", breaker)],
+        move || match (circuit.is_closed(), circuit.is_open()) {
+            (true, _) => 0.0,
+            (false, true) => 2.0,
+            (false, false) => 1.0,
+        },
+    );
+}
+
+/// `GET /metrics`, optionally behind `Authorization: Bearer <METRICS_TOKEN>`.
+fn metrics_router(token: Option<Zeroizing<String>>) -> axum::Router {
+    use axum::http::{header, HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    let token = std::sync::Arc::new(token);
+    axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move |headers: HeaderMap| {
+            let token = token.clone();
+            async move {
+                if let Some(expected) = token.as_ref() {
+                    let presented = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .unwrap_or("");
+                    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                }
+                (
+                    [(header::CONTENT_TYPE, octo_metrics::CONTENT_TYPE)],
+                    octo_metrics::render(),
+                )
+                    .into_response()
+            }
+        }),
+    )
+}
+
+/// Compare without an early exit, so response timing doesn't reveal how much of a token matched.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Resolve on SIGTERM (what Kubernetes/ECS send on a rolling deploy) or SIGINT (Ctrl-C).
@@ -435,6 +509,8 @@ struct Config {
     /// `RUN_MIGRATIONS`, default true. Set false when the server connects as a runtime role that
     /// lacks DDL rights and migrations are applied separately by the migrator role.
     run_migrations: bool,
+    /// Prometheus `/metrics` listener; `None` (the default) when `METRICS_BIND_ADDR` is unset.
+    metrics: Option<MetricsConfig>,
     /// Resilience settings for all Horizon clients (API + ingest).
     ///
     /// | Variable | Default | Description |
@@ -466,6 +542,7 @@ impl fmt::Debug for Config {
             .field("ingest_interval_secs", &self.ingest_interval_secs)
             .field("ingest_page_limit", &self.ingest_page_limit)
             .field("shutdown_drain_timeout", &self.shutdown_drain_timeout)
+            .field("metrics", &self.metrics)
             .field("resilience", &self.resilience)
             .finish()
     }
@@ -567,6 +644,7 @@ impl Config {
         };
 
         let resilience = ResilienceConfig::from_env();
+        let metrics = MetricsConfig::from_env()?;
 
         Ok(Config {
             database_url,
@@ -589,8 +667,59 @@ impl Config {
             ingest_lock_retry,
             shutdown_drain_timeout,
             run_migrations,
+            metrics,
             resilience,
         })
+    }
+}
+
+/// `/metrics` listener settings. Off unless `METRICS_BIND_ADDR` is set.
+#[derive(Clone)]
+struct MetricsConfig {
+    bind_addr: std::net::SocketAddr,
+    /// `METRICS_TOKEN`: bearer token scrapers must present. Required on non-loopback binds.
+    token: Option<Zeroizing<String>>,
+}
+
+impl fmt::Debug for MetricsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetricsConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+impl MetricsConfig {
+    /// Minimum `METRICS_TOKEN` length, so a reachable endpoint isn't guarded by a guessable one.
+    const MIN_TOKEN_LEN: usize = 32;
+
+    fn from_env() -> Result<Option<MetricsConfig>> {
+        let raw = std::env::var("METRICS_BIND_ADDR").unwrap_or_default();
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        let bind_addr: std::net::SocketAddr = raw
+            .trim()
+            .parse()
+            .with_context(|| format!("METRICS_BIND_ADDR must be an ip:port (got {raw:?})"))?;
+        let token = std::env::var("METRICS_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .map(Zeroizing::new);
+        std::env::remove_var("METRICS_TOKEN");
+        if let Some(t) = &token {
+            if t.len() < Self::MIN_TOKEN_LEN {
+                anyhow::bail!("METRICS_TOKEN must be at least {} bytes", Self::MIN_TOKEN_LEN);
+            }
+        }
+        // Fail closed: anything beyond loopback must authenticate scrapers.
+        if !bind_addr.ip().is_loopback() && token.is_none() {
+            anyhow::bail!(
+                "METRICS_TOKEN is required when METRICS_BIND_ADDR is not a loopback address"
+            );
+        }
+        Ok(Some(MetricsConfig { bind_addr, token }))
     }
 }
 

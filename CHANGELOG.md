@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Prometheus `/metrics` on a separate, opt-in listener (token required off loopback): HTTP
+  latency histograms, circuit-breaker state, webhook outcomes and ingest tick/lag series, all
+  with bounded label cardinality (#467). See `docs/metrics.md`.
 - Account data export and deletion, each gated by password plus an emailed OTP. Deletion is
   refused while any wallet holds funds, tombstones the user and anonymises (and re-links) the
   retained audit chain; the export contains no secrets (#466).

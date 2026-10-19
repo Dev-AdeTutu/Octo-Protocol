@@ -21,6 +21,7 @@ octo-webhooks.workspace = true
 octo-email.workspace = true
 octo-wallet-core.workspace = true
 octo-resilience.workspace = true
+octo-metrics.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
