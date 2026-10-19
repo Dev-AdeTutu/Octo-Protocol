@@ -15,7 +15,7 @@ pub struct Summary(Vec<(&'static str, String)>);
 
 impl Summary {
     pub fn new(cfg: &Config, telemetry: &TelemetryConfig) -> Summary {
-        let set = |present: bool| if present { "set" } else { "unset" }.to_string();
+        let set = |present: bool| String::from(if present { "set" } else { "unset" });
         let db = &cfg.store;
         let metrics = cfg.metrics.as_ref();
         Summary(vec![
