@@ -56,5 +56,3 @@ serde_yaml = "0.9"
 jsonschema = "0.26"
 # Signing fixtures for validation tests only — never enabled in production builds.
 octo-wallet-core = { workspace = true, features = ["test-fixtures"] }
-# Captures OTP codes in memory instead of emailing them — never enabled in production builds.
-octo-email = { workspace = true, features = ["test-fixtures"] }

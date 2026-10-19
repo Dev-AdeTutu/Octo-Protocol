@@ -123,6 +123,14 @@ pub fn otp_email(code: &str, purpose: &str) -> String {
     )
 }
 
+/// The OTP inside an [`otp_email`] body, for test transports that capture rendered messages.
+pub fn extract_otp(html: &str) -> Option<String> {
+    let marker = "letter-spacing:6px;color:#fff;\">";
+    let start = html.find(marker)? + marker.len();
+    let code = html.get(start..start + 6)?;
+    code.bytes().all(|b| b.is_ascii_digit()).then(|| code.to_string())
+}
+
 /// Escape untrusted text for interpolation into HTML (emails are only loosely validated).
 fn escape_html(input: &str) -> String {
     input
@@ -212,4 +220,15 @@ pub fn withdrawal_failed_email(
         ),
         Icon::Warn,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_otp_round_trips_the_rendered_otp_email() {
+        assert_eq!(extract_otp(&otp_email("042817", "signup")).as_deref(), Some("042817"));
+        assert_eq!(extract_otp(&welcome_email("a@b.test")), None);
+    }
 }
