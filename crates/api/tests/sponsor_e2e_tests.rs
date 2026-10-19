@@ -1159,5 +1159,6 @@ async fn sponsor_validate_reports_the_real_endpoints_rejection() {
     assert_eq!(verdict["data"]["verdict"], "rejected");
     assert_eq!(verdict["data"]["rejection_status"], real_status.as_u16());
     assert_eq!(verdict["data"]["reason"], real_json["message"]);
+    assert_eq!(verdict["data"]["rejection_code"], real_json["code"]);
     assert_eq!(sponsored_row_count(&state, &wallet_id).await, 0);
 }

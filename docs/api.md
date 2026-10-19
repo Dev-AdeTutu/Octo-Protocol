@@ -4,10 +4,12 @@ The machine-readable contract is **[openapi.yaml](openapi.yaml)**, and it is enf
 `drift_tests` integration test validates live responses against that spec, so the two cannot
 silently diverge. This page is the human-readable tour.
 
-All responses use a consistent envelope — **including errors**, where `data` is `null`:
+All responses use a consistent envelope — **including errors**, where `data` is `null` and a
+stable machine-readable `code` is added (see [Error codes](#error-codes)):
 
 ```json
 { "statusCode": 200, "message": "OK", "data": { } }
+{ "statusCode": 409, "code": "conflict", "message": "payment link is cancelled and cannot be reactivated", "data": null }
 ```
 
 ## Authentication
@@ -120,9 +122,10 @@ carries fee float only — the one server-held key in the system, bounded by you
 - `POST /v1/wallets/{id}/sponsor/validate` — dry run of `/sponsor` with the same body. It runs
   the **same validation code** (enabled flag, per-tx cap, op allowlist, self-sponsorship,
   custody, on-chain sequence) plus read-only dedup and daily-budget projections, then returns
-  `200` with `{ verdict: "accepted" | "rejected", reason, rejection_status,
-  projected_fee_stroops, inner_tx_hash, budget_remaining_stroops }`. `rejection_status` and
-  `reason` are the status and message `/sponsor` would answer with. Nothing is signed, reserved,
+  `200` with `{ verdict: "accepted" | "rejected", reason, rejection_status, rejection_code,
+  projected_fee_stroops, inner_tx_hash, budget_remaining_stroops }`. `rejection_status`,
+  `rejection_code` and `reason` are the status, error `code` and message `/sponsor` would answer
+  with. Nothing is signed, reserved,
   submitted, audited or sent as a webhook. Auth failures and upstream errors (`5xx`) still answer
   as errors. A dry run is advisory: concurrent sponsorships can still exhaust the budget before
   the real call.
@@ -211,6 +214,33 @@ so it cannot escalate or revoke itself.
 - **Amounts** are integer **stroops** (1 XLM = 10,000,000) end-to-end — never floats.
 - **Errors** map to `400` (validation), `401`, `403`, `404`, `409` (conflict), `410` (removed
   custodial endpoints), `413` (body over 64 KiB), `429` (budget exceeded). There is no `422`.
+  Branch on `code`, never on `message`.
+
+## Error codes
+
+Every error response — from a handler, an extractor rejection (bad JSON, bad path/query
+parameter), an unknown route, a wrong method, or the body-size limit — carries `code`. Codes are
+a stable contract: they are never renamed or reused, and a new one is only ever added. `message`
+is human-readable and may change at any time. The catalogue lives in `ERROR_CODES`
+(`crates/api/src/error.rs`), mirrors `ErrorResponse.code` in `openapi.yaml`, and is pinned by a
+snapshot test (`crates/api/tests/snapshots/error_codes.snap`).
+
+| Code | Status | Meaning |
+|---|---|---|
+| `bad_request` | 400 | The request was malformed or failed validation. |
+| `stale_sequence` | 400 | The transaction's sequence number is stale; refresh signing info and rebuild. |
+| `unauthorized` | 401 | Missing, invalid or revoked credentials. |
+| `forbidden` | 403 | Authenticated, but the server refuses this action for this resource. |
+| `not_found` | 404 | The resource or route does not exist, or is not visible to this caller. |
+| `method_not_allowed` | 405 | The route exists but not for this HTTP method. |
+| `already_exists` | 409 | A resource with this identity already exists (duplicate). |
+| `conflict` | 409 | The resource's current state does not allow this change. |
+| `gone` | 410 | The endpoint or resource has been permanently removed or closed. |
+| `payload_too_large` | 413 | The request body exceeds the 64 KiB limit. |
+| `unsupported_media_type` | 415 | The request body has an unsupported Content-Type. |
+| `too_many_requests` | 429 | A rate limit or budget would be exceeded. |
+| `internal_error` | 500 | An internal error occurred; details are logged, never returned. |
+| `upstream_timeout` | 504 | An upstream dependency (e.g. Horizon) did not answer in time. |
 
 ## Rate Limits
 

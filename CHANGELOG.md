@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- API: every error response carries a stable machine-readable `code` (catalogue in
+  `docs/api.md` and `ErrorResponse.code` in `docs/openapi.yaml`, pinned by a snapshot test).
+  Framework rejections, unknown routes and 405s now use the JSON error envelope too (#465).
+  **Breaking:** error bodies gain a required `code` field, and non-handler errors that were plain
+  text are now JSON.
 - Security: `octo-server` exits non-zero on mainnet when secrets are placeholders or low-entropy,
   or when `HORIZON_URL` / `PUBLIC_APP_URL` / `PUBLIC_API_URL` are not HTTPS (#433).
 - CI: CycloneDX SBOM (full transitive tree) uploaded on every `main` build and attached to

@@ -43,6 +43,8 @@ pub struct SponsorValidateResponse {
     pub reason: Option<String>,
     /// HTTP status the real endpoint would answer with; `None` when accepted.
     pub rejection_status: Option<u16>,
+    /// Machine-readable error `code` the real endpoint would answer with; `None` when accepted.
+    pub rejection_code: Option<&'static str>,
     /// Fee ceiling the real call would reserve against the daily budget.
     pub projected_fee_stroops: Option<i64>,
     /// Dedup key of the inner transaction, once it parses.
@@ -173,6 +175,7 @@ pub async fn validate_sponsor(
             verdict: "accepted",
             reason: None,
             rejection_status: None,
+            rejection_code: None,
             projected_fee_stroops: Some(p.max_fee),
             inner_tx_hash: Some(p.inner_hash_hex),
             budget_remaining_stroops,
@@ -186,6 +189,7 @@ pub async fn validate_sponsor(
                 verdict: "rejected",
                 reason: Some(message),
                 rejection_status: Some(status.as_u16()),
+                rejection_code: Some(e.code()),
                 projected_fee_stroops: requested_fee,
                 inner_tx_hash: None,
                 budget_remaining_stroops: None,
