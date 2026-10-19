@@ -121,9 +121,39 @@ deliveries (its `auto_disabled_at` is then set); unset means never.
 
 ## Payment links
 
+- `POST   /v1/wallets/{id}/payment-links` — create a link. Optional `expires_at` (RFC 3339, in
+  the future, at most 365 days away) time-boxes it.
 - `PATCH  /v1/wallets/{id}/payment-links/{link_id}` — edit `description`, `redirect_url` and
   `amount_usdc_stroops` (omit to keep, `null` to clear). Allowed only while no payment is
-  pending or has landed; otherwise `409`. Edits are audit-logged.
+  pending or has landed; otherwise `409`. Requires the `write` scope. Edits are audit-logged.
+- `POST   /v1/wallets/{id}/payment-links/{link_id}/cancel` — permanently close a link
+  (idempotent, `write` scope, audit-logged). Its pending payments become `cancelled` and each
+  fires a `payment_link.cancelled` webhook. A cancelled link can't be re-activated (`PUT` → `409`).
+
+Every link view carries `status`: `active`, `inactive` (paused via `PUT`), `expired` (at or past
+`expires_at`) or `cancelled`. Expired and cancelled are terminal.
+
+On the public pay routes a paused link is `404`. An expired or cancelled link is still readable
+at `GET /v1/pay/{slug}` with its `status` and `deposit_address: null`; creating an intent,
+fetching signing info or relaying a payment answers `410`. `submit-signed` for a `payment_id`
+that is no longer `pending` answers `409`. Polling a pending payment on a closed link reports
+the link's `expired`/`cancelled` status straight away.
+
+### Late payments
+
+A deposit is matched to a payment only if, when ingest records it, the payment is still
+`pending` **and** the link is neither cancelled nor at/past `expires_at`. Anything later is a
+*late deposit*:
+
+- The funds are already in the merchant's wallet (Octo is non-custodial and cannot bounce them).
+  The deposit is recorded and `deposit.created` fires as for any deposit; its address `metadata`
+  carries `payment_link_slug` for reconciliation.
+- The payment is **not** confirmed, no `payment_link.paid` / `payment_link.mismatched` fires,
+  and it does not count towards `collected_usdc_stroops`.
+- Refunding or honouring a late deposit is the merchant's decision.
+
+Pending payments on an expired link are flipped to `expired` by the ingest sweep (firing
+`payment_link.expired`), alongside the existing one-hour intent deadline.
 
 ## API keys
 

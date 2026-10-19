@@ -308,6 +308,30 @@ pub struct PaymentLink {
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Optional merchant deadline; at or past it the link is not payable (#454).
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Set once when the merchant cancels; a cancelled link is permanently closed (#454).
+    pub cancelled_at: Option<DateTime<Utc>>,
+}
+
+impl PaymentLink {
+    /// True once the link is cancelled or past its deadline at `now` — it can never be paid again.
+    pub fn is_closed_at(&self, now: DateTime<Utc>) -> bool {
+        self.cancelled_at.is_some() || self.expires_at.is_some_and(|e| now >= e)
+    }
+
+    /// Lifecycle state at `now`: `cancelled` and `expired` (terminal) win over the `active` toggle.
+    pub fn status_at(&self, now: DateTime<Utc>) -> &'static str {
+        if self.cancelled_at.is_some() {
+            "cancelled"
+        } else if self.expires_at.is_some_and(|e| now >= e) {
+            "expired"
+        } else if self.active {
+            "active"
+        } else {
+            "inactive"
+        }
+    }
 }
 
 /// Input to create a new payment link.
@@ -321,6 +345,7 @@ pub struct NewPaymentLink<'a> {
     pub image_url: Option<&'a str>,
     pub redirect_url: Option<&'a str>,
     pub amount_usdc_stroops: Option<i64>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Owner edits to a payment link. Outer `None` leaves a field unchanged; `Some(None)` clears it.

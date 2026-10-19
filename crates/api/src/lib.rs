@@ -305,6 +305,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/:id/payment-links/:link_id/payments",
             get(routes::payment_links::list_payment_link_payments),
         )
+        .route(
+            "/v1/wallets/:id/payment-links/:link_id/cancel",
+            post(routes::payment_links::cancel_payment_link),
+        )
         // Public: no auth, reachable by anyone with the link.
         .route(
             "/v1/pay/:slug",
