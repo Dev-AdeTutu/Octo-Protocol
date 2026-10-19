@@ -440,7 +440,8 @@ pub(crate) async fn anonymise_chain(
             fields.ip_address = None;
             let new_hash = row_hash(key, &new_prev, &fields);
             sqlx::query(
-                "UPDATE audit_logs SET target = NULL, ip_address = NULL, prev_hash = $2, row_hash = $3
+                "UPDATE audit_logs
+                 SET target = NULL, ip_address = NULL, prev_hash = $2, row_hash = $3
                  WHERE id = $1",
             )
             .bind(row.id)

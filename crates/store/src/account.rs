@@ -43,73 +43,74 @@ pub struct AccountDeletion {
     pub audit_rows_anonymised: u64,
 }
 
-/// Run one export query, fetching one extra row to detect truncation.
-macro_rules! section {
-    ($store:expr, $truncated:expr, $name:literal, $ty:ty, $sql:literal, $user:expr) => {{
-        let mut rows = sqlx::query_as::<_, $ty>($sql)
-            .bind($user)
-            .bind(EXPORT_SECTION_LIMIT + 1)
-            .fetch_all(&$store.pool)
-            .await?;
-        if rows.len() as i64 > EXPORT_SECTION_LIMIT {
-            rows.truncate(EXPORT_SECTION_LIMIT as usize);
-            $truncated.push($name);
-        }
-        rows
-    }};
-}
+// Export queries: `$1` is the user id, `$2` the row limit; wallet tables join to their owner.
+const WALLETS_SQL: &str =
+    "SELECT * FROM wallets WHERE user_id = $1 ORDER BY created_at, id LIMIT $2";
+const ADDRESSES_SQL: &str = "SELECT a.* FROM addresses a JOIN wallets w ON w.id = a.wallet_id
+     WHERE w.user_id = $1 ORDER BY a.created_at, a.id LIMIT $2";
+const TRANSACTIONS_SQL: &str = "SELECT t.* FROM transactions t JOIN wallets w ON w.id = t.wallet_id
+     WHERE w.user_id = $1 ORDER BY t.created_at, t.id LIMIT $2";
+const WITHDRAWALS_SQL: &str = "SELECT x.* FROM withdrawals x JOIN wallets w ON w.id = x.wallet_id
+     WHERE w.user_id = $1 ORDER BY x.created_at, x.id LIMIT $2";
+const SPONSORED_SQL: &str =
+    "SELECT s.* FROM sponsored_transactions s JOIN wallets w ON w.id = s.wallet_id
+     WHERE w.user_id = $1 ORDER BY s.created_at, s.id LIMIT $2";
+const API_KEYS_SQL: &str = "SELECT k.* FROM api_keys k JOIN wallets w ON w.id = k.wallet_id
+     WHERE w.user_id = $1 ORDER BY k.created_at, k.id LIMIT $2";
+const WEBHOOKS_SQL: &str = "SELECT e.* FROM webhook_endpoints e JOIN wallets w ON w.id = e.wallet_id
+     WHERE w.user_id = $1 ORDER BY e.created_at, e.id LIMIT $2";
+const WHITELIST_SQL: &str =
+    "SELECT a.* FROM whitelisted_addresses a JOIN wallets w ON w.id = a.wallet_id
+     WHERE w.user_id = $1 ORDER BY a.created_at, a.id LIMIT $2";
+const PAYMENT_LINKS_SQL: &str =
+    "SELECT l.* FROM payment_links l JOIN wallets w ON w.id = l.wallet_id
+     WHERE w.user_id = $1 ORDER BY l.created_at, l.id LIMIT $2";
+const PAYMENTS_SQL: &str = "SELECT p.* FROM payment_link_payments p
+     JOIN payment_links l ON l.id = p.payment_link_id
+     JOIN wallets w ON w.id = l.wallet_id
+     WHERE w.user_id = $1 ORDER BY p.created_at, p.id LIMIT $2";
+const SESSIONS_SQL: &str =
+    "SELECT * FROM sessions WHERE user_id = $1 ORDER BY created_at, id LIMIT $2";
+const AUDIT_SQL: &str = "SELECT id, user_id, action, category, target, ip_address, created_at
+     FROM audit_logs WHERE user_id = $1 ORDER BY created_at, id LIMIT $2";
 
 impl Store {
     /// Collect a live user's data for export. `NotFound` for unknown or deleted users.
     pub async fn export_account(&self, user_id: Uuid) -> Result<AccountData, StoreError> {
-        let user = sqlx::query_as::<_, User>(
-            "SELECT * FROM users WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(StoreError::NotFound)?;
+        let user =
+            sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1 AND deleted_at IS NULL")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or(StoreError::NotFound)?;
 
-        let mut truncated = Vec::new();
-        let wallets = section!(self, truncated, "wallets", Wallet,
-            "SELECT * FROM wallets WHERE user_id = $1 ORDER BY created_at, id LIMIT $2", user_id);
-        let addresses = section!(self, truncated, "addresses", Address,
-            "SELECT a.* FROM addresses a JOIN wallets w ON w.id = a.wallet_id
-             WHERE w.user_id = $1 ORDER BY a.created_at, a.id LIMIT $2", user_id);
-        let transactions = section!(self, truncated, "transactions", Transaction,
-            "SELECT t.* FROM transactions t JOIN wallets w ON w.id = t.wallet_id
-             WHERE w.user_id = $1 ORDER BY t.created_at, t.id LIMIT $2", user_id);
-        let withdrawals = section!(self, truncated, "withdrawals", Withdrawal,
-            "SELECT x.* FROM withdrawals x JOIN wallets w ON w.id = x.wallet_id
-             WHERE w.user_id = $1 ORDER BY x.created_at, x.id LIMIT $2", user_id);
-        let sponsored_transactions = section!(self, truncated, "sponsored_transactions",
-            SponsoredTransaction,
-            "SELECT s.* FROM sponsored_transactions s JOIN wallets w ON w.id = s.wallet_id
-             WHERE w.user_id = $1 ORDER BY s.created_at, s.id LIMIT $2", user_id);
-        let api_keys = section!(self, truncated, "api_keys", ApiKey,
-            "SELECT k.* FROM api_keys k JOIN wallets w ON w.id = k.wallet_id
-             WHERE w.user_id = $1 ORDER BY k.created_at, k.id LIMIT $2", user_id);
-        let webhook_endpoints = section!(self, truncated, "webhook_endpoints", WebhookEndpoint,
-            "SELECT e.* FROM webhook_endpoints e JOIN wallets w ON w.id = e.wallet_id
-             WHERE w.user_id = $1 ORDER BY e.created_at, e.id LIMIT $2", user_id);
-        let whitelisted_addresses = section!(self, truncated, "whitelisted_addresses",
-            WhitelistedAddress,
-            "SELECT a.* FROM whitelisted_addresses a JOIN wallets w ON w.id = a.wallet_id
-             WHERE w.user_id = $1 ORDER BY a.created_at, a.id LIMIT $2", user_id);
-        let payment_links = section!(self, truncated, "payment_links", PaymentLink,
-            "SELECT l.* FROM payment_links l JOIN wallets w ON w.id = l.wallet_id
-             WHERE w.user_id = $1 ORDER BY l.created_at, l.id LIMIT $2", user_id);
-        let payment_link_payments = section!(self, truncated, "payment_link_payments",
-            PaymentLinkPayment,
-            "SELECT p.* FROM payment_link_payments p
-             JOIN payment_links l ON l.id = p.payment_link_id
-             JOIN wallets w ON w.id = l.wallet_id
-             WHERE w.user_id = $1 ORDER BY p.created_at, p.id LIMIT $2", user_id);
-        let sessions = section!(self, truncated, "sessions", Session,
-            "SELECT * FROM sessions WHERE user_id = $1 ORDER BY created_at, id LIMIT $2", user_id);
-        let audit_logs = section!(self, truncated, "audit_logs", AuditLog,
-            "SELECT id, user_id, action, category, target, ip_address, created_at
-             FROM audit_logs WHERE user_id = $1 ORDER BY created_at, id LIMIT $2", user_id);
+        let mut cut = Vec::new();
+        let wallets: Vec<Wallet> = self.section(&mut cut, "wallets", WALLETS_SQL, user_id).await?;
+        let addresses: Vec<Address> =
+            self.section(&mut cut, "addresses", ADDRESSES_SQL, user_id).await?;
+        let transactions: Vec<Transaction> =
+            self.section(&mut cut, "transactions", TRANSACTIONS_SQL, user_id).await?;
+        let withdrawals: Vec<Withdrawal> =
+            self.section(&mut cut, "withdrawals", WITHDRAWALS_SQL, user_id).await?;
+        let sponsored_transactions: Vec<SponsoredTransaction> = self
+            .section(&mut cut, "sponsored_transactions", SPONSORED_SQL, user_id)
+            .await?;
+        let api_keys: Vec<ApiKey> =
+            self.section(&mut cut, "api_keys", API_KEYS_SQL, user_id).await?;
+        let webhooks: Vec<WebhookEndpoint> =
+            self.section(&mut cut, "webhook_endpoints", WEBHOOKS_SQL, user_id).await?;
+        let whitelisted_addresses: Vec<WhitelistedAddress> = self
+            .section(&mut cut, "whitelisted_addresses", WHITELIST_SQL, user_id)
+            .await?;
+        let links: Vec<PaymentLink> =
+            self.section(&mut cut, "payment_links", PAYMENT_LINKS_SQL, user_id).await?;
+        let payment_link_payments: Vec<PaymentLinkPayment> = self
+            .section(&mut cut, "payment_link_payments", PAYMENTS_SQL, user_id)
+            .await?;
+        let sessions: Vec<Session> =
+            self.section(&mut cut, "sessions", SESSIONS_SQL, user_id).await?;
+        let audit_logs: Vec<AuditLog> =
+            self.section(&mut cut, "audit_logs", AUDIT_SQL, user_id).await?;
 
         Ok(AccountData {
             user,
@@ -119,14 +120,37 @@ impl Store {
             withdrawals,
             sponsored_transactions,
             api_keys,
-            webhook_endpoints,
+            webhook_endpoints: webhooks,
             whitelisted_addresses,
-            payment_links,
+            payment_links: links,
             payment_link_payments,
             sessions,
             audit_logs,
-            truncated,
+            truncated: cut,
         })
+    }
+
+    /// Run one export query, fetching one extra row to detect (and record) truncation.
+    async fn section<T>(
+        &self,
+        truncated: &mut Vec<&'static str>,
+        name: &'static str,
+        sql: &'static str,
+        user_id: Uuid,
+    ) -> Result<Vec<T>, StoreError>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
+    {
+        let mut rows = sqlx::query_as::<_, T>(sql)
+            .bind(user_id)
+            .bind(EXPORT_SECTION_LIMIT + 1)
+            .fetch_all(&self.pool)
+            .await?;
+        if rows.len() > EXPORT_SECTION_LIMIT as usize {
+            rows.truncate(EXPORT_SECTION_LIMIT as usize);
+            truncated.push(name);
+        }
+        Ok(rows)
     }
 
     /// Delete a user's account in one transaction: scrub the user row to a tombstone, revoke every

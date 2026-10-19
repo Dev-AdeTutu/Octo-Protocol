@@ -285,7 +285,7 @@ pub async fn export_request_otp(
     Ok(Envelope::ok(OtpSentResponse { sent: true }))
 }
 
-/// `POST /v1/auth/account/export` — redeem the code and return everything stored about the caller.
+/// `POST /v1/auth/account/export` — redeem the code and return everything stored about you.
 pub async fn export_account(
     State(state): State<AppState>,
     peer: Option<ConnectInfo<SocketAddr>>,
@@ -345,7 +345,7 @@ pub async fn delete_account(
                 ApiError::ConflictWith("your wallets changed during deletion; try again".into())
             }
             StoreError::AuditChainCorrupt => {
-                tracing::error!(user_id = %user.id, "account deletion refused: audit chain corrupt");
+                tracing::error!(user_id = %user.id, "account deletion refused: audit chain bad");
                 ApiError::ConflictWith("account deletion is unavailable; contact support".into())
             }
             other => ApiError::from(other),
@@ -450,8 +450,9 @@ async fn owned_wallets(state: &AppState, user_id: Uuid) -> Result<Vec<Wallet>, A
 /// Refuse while any wallet (or its gas tank) holds a balance. Fails closed when Horizon can't
 /// answer, or when a wallet lives on a network this server can't query.
 async fn ensure_no_funds(state: &AppState, wallets: &[Wallet]) -> Result<(), ApiError> {
-    let unavailable =
-        || ApiError::ServiceUnavailable("could not confirm wallet balances; try again later".into());
+    let unavailable = || {
+        ApiError::ServiceUnavailable("could not confirm wallet balances; try again later".into())
+    };
     let mut funded = Vec::new();
     for wallet in wallets {
         if wallet.network != state.network().as_str() {
