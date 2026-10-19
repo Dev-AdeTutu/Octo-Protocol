@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `octo-server --check-config`: validates the environment, the mainnet guard, database
+  connectivity and pending migrations, prints a redacted summary and exits non-zero on any
+  failure (#469). Also adds the `Store::ping` the readiness probe already called.
+- Optional OTLP/HTTP span export behind the `otel` cargo feature and
+  `OTEL_EXPORTER_OTLP_ENDPOINT` (both off by default), with `traceparent` propagation to
+  Horizon and sensitive span fields dropped before export (#468). See `docs/tracing.md`.
+- Prometheus `/metrics` on a separate, opt-in listener (token required off loopback): HTTP
+  latency histograms, circuit-breaker state, webhook outcomes and ingest tick/lag series, all
+  with bounded label cardinality (#467). See `docs/metrics.md`.
+- Account data export and deletion, each gated by password plus an emailed OTP. Deletion is
+  refused while any wallet holds funds, tombstones the user and anonymises (and re-links) the
+  retained audit chain; the export contains no secrets (#466).
 - Email: transient Resend failures (429/5xx/timeouts) are retried with backoff under a 25s
   overall deadline and 4xx is never retried (#470); delivery sits behind an `EmailTransport`
   trait with Resend, capture, log-only and failing implementations, and the `test-fixtures`

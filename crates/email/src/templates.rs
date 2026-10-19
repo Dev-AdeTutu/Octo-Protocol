@@ -128,6 +128,8 @@ pub fn otp_email(code: &str, purpose: &str) -> Body {
         "withdrawal" => "confirm a withdrawal",
         "password_reset" => "reset your password",
         "email_change" => "confirm your new email address",
+        "account_export" => "export your account data",
+        "account_delete" => "permanently delete your account",
         _ => "verify your email",
     };
     let html = shell(
@@ -184,6 +186,15 @@ pub fn email_changed_email(new_email: &str) -> Body {
         format!("This account's email is now {raw}. If this wasn't you, reset your password right away."),
     ]);
     Body { html, text }
+}
+
+/// Sent to the former address once an account deletion completes, so an unwanted one is noticed.
+pub fn account_deleted_email() -> String {
+    shell(
+        "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Your Octo account was deleted</p>\
+<p style=\"margin:0;color:#666;\">Your profile, sessions and API keys have been removed. If this wasn't you, contact support immediately.</p>",
+        Icon::Warn,
+    )
 }
 
 /// Sent once, right after signup verification succeeds.

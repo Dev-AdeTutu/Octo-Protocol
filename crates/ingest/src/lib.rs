@@ -70,6 +70,14 @@ impl LastPollTracker {
     }
 }
 
+/// Current Unix time in seconds (0 if the clock is before the epoch).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Outcome of processing a single payment record.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Processed {
@@ -156,11 +164,7 @@ impl Ingestor {
         }
 
         if let Some(ref tracker) = self.tracker {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            tracker.record_success(self.wallet_id, now);
+            tracker.record_success(self.wallet_id, unix_now());
         }
 
         Ok(count)
@@ -280,6 +284,8 @@ impl Ingestor {
 
         match self.store.record_deposit(&dep).await? {
             Some(tx) => {
+                let attributed_label = if attributed { "true" } else { "false" };
+                octo_metrics::INGEST_DEPOSITS.inc(&[attributed_label]);
                 self.fire_deposit_webhook(&tx).await;
                 self.confirm_payment_link(&tx).await;
                 Ok(Processed::Recorded { attributed })
@@ -683,7 +689,9 @@ impl Supervisor {
     ) {
         while let Some(mut lock) = self.wait_for_leadership(&shutdown).await {
             tracing::info!(network = self.network, "acquired ingest leader lock; ingesting");
+            octo_metrics::INGEST_LEADER.set(&[], 1.0);
             self.lead(&mut lock, interval, page_limit, &shutdown).await;
+            octo_metrics::INGEST_LEADER.set(&[], 0.0);
             // Free the lock promptly so a standby takes over on its next retry, not on TCP timeout.
             lock.release().await;
         }
@@ -729,9 +737,19 @@ impl Supervisor {
                 tracing::warn!(network = self.network, "lost ingest leader lock; standing by");
                 return;
             }
-            if let Err(e) = self.tick(page_limit).await {
-                tracing::warn!(error = ?e, "ingest supervisor tick failed; will retry");
-            }
+            let started = std::time::Instant::now();
+            let outcome = match self.tick(page_limit).await {
+                Ok(_) => {
+                    octo_metrics::INGEST_LAST_SUCCESS.set(&[], unix_now() as f64);
+                    "ok"
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "ingest supervisor tick failed; will retry");
+                    "error"
+                }
+            };
+            let elapsed = started.elapsed().as_secs_f64();
+            octo_metrics::INGEST_TICK_DURATION.observe(&[outcome], elapsed);
             // Wake early on shutdown instead of sleeping out the full interval.
             tokio::select! {
                 () = tokio::time::sleep(interval) => {}
@@ -752,6 +770,7 @@ impl Supervisor {
         self.expire_stale_payment_link_payments().await;
         let page_limit = page_limit.clamp(1, Self::MAX_HORIZON_PAGE_LIMIT);
 
+        // Paused wallets (#450) are excluded by the query and keep their cursor for resume.
         // Only wallets actually due under the backoff tiers — a dev/production DB accumulates
         // wallets that never transact again, and polling them every cycle starves the active ones
         // of the shared concurrency budget. Paged by id so memory doesn't scale with wallet count.

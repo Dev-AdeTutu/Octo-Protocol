@@ -68,6 +68,16 @@ just test
 just run            # cargo run -p octo-server  → API on $BIND_ADDR (default :8080)
 ```
 
+### Configuration
+
+Every setting is read from the environment (or `.env`). The complete reference — purpose,
+default, whether it is required, and whether it is a **secret** — lives in
+[docs/environment-variables.md](docs/environment-variables.md). Read it before copying
+`.env.example`, and never commit a filled-in `.env`.
+
+CI enforces this: a test fails if the server reads an environment variable that is not
+documented in that reference, so the table always matches the code.
+
 Then, against a running server (testnet):
 
 All routes below require a dashboard login token (`Authorization: Bearer <JWT>` from
@@ -107,6 +117,9 @@ See [docs/non-custodial-flow.md](docs/non-custodial-flow.md) for the full
 build → sign → relay sequence. Accepting payments via a shareable link is walked through in
 [docs/api.md](docs/api.md#payment-link-checkout-flow); account activity categories are in
 [docs/audit-log.md](docs/audit-log.md).
+
+New here? Follow the end-to-end, curl-only walkthrough from signup to a received deposit
+(including webhook delivery) in **[docs/quickstart-testnet.md](docs/quickstart-testnet.md)**.
 
 ## Security architecture
 

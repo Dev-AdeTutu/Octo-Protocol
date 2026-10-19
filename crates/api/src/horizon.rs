@@ -22,6 +22,7 @@
 use crate::error::ApiError;
 use octo_resilience::{execute, CallKind, CircuitBreaker, ResilienceError, RetryPolicy};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Timeout for balance/sequence reads and friendbot funding — these are simple GETs against a
@@ -32,6 +33,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// the connection while the tx is validated/applied), so it gets a longer per-request override
 /// instead of raising the client's default for every call.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Fee suggestions must not stall signing-info requests when Horizon's auxiliary endpoint is slow.
+const FEE_STATS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A single balance line from a Horizon account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +61,12 @@ struct AccountResponse {
     num_sponsoring: i64,
     #[serde(default)]
     num_sponsored: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeeStatsResponse {
+    #[serde(default)]
+    fee_charged: HashMap<String, serde_json::Value>,
 }
 
 /// Everything the withdrawal pre-flight checks need about the source account, fetched in a
@@ -263,12 +272,16 @@ impl Horizon {
             account_g
         );
         let http = self.http.clone();
+        // Captured here, inside the instrumented span, so retries share one parent context.
+        let trace = trace_headers();
         let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
             let url = url.clone();
             let http = http.clone();
+            let trace = trace.clone();
             async move {
                 let resp = http
                     .get(&url)
+                    .headers(trace)
                     .send()
                     .await
                     .map_err(|_| FetchError::Transport)?;
@@ -337,13 +350,17 @@ impl Horizon {
             account_g
         );
         let http = self.http.clone();
+        // Captured here, inside the instrumented span, so retries share one parent context.
+        let trace = trace_headers();
 
         let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
             let url = url.clone();
             let http = http.clone();
+            let trace = trace.clone();
             async move {
                 let resp = http
                     .get(&url)
+                    .headers(trace)
                     .send()
                     .await
                     .map_err(|_| FetchError::Transport)?;
@@ -392,6 +409,45 @@ impl Horizon {
         }
     }
 
+    /// Choose a per-operation fee from Horizon's configured percentile, bounded by `ceiling`.
+    /// Missing, malformed, or unavailable fee stats fall back to the network base fee.
+    pub async fn recommended_fee_stroops(
+        &self,
+        percentile: u8,
+        base_fee_stroops: i64,
+        ceiling_stroops: i64,
+    ) -> i64 {
+        debug_assert!(ceiling_stroops >= base_fee_stroops);
+        let fee = self
+            .fee_stats_percentile(percentile)
+            .await
+            .filter(|fee| *fee > 0)
+            .unwrap_or(base_fee_stroops)
+            .max(base_fee_stroops);
+        fee.min(ceiling_stroops)
+    }
+
+    async fn fee_stats_percentile(&self, percentile: u8) -> Option<i64> {
+        let key = format!("p{percentile}");
+        let url = format!("{}/fee_stats", self.base_url.trim_end_matches('/'));
+        let http = self.http.clone();
+        tokio::time::timeout(FEE_STATS_TIMEOUT, async move {
+            let response = http.get(url).send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            let stats: FeeStatsResponse = response.json().await.ok()?;
+            let value = stats.fee_charged.get(&key)?;
+            value
+                .as_str()
+                .and_then(|raw| raw.parse::<i64>().ok())
+                .or_else(|| value.as_i64())
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Submit a signed transaction (base64 XDR envelope) to Horizon.
     ///
     /// **Not retried** — see the module-level documentation and [`octo_resilience`] for the full
@@ -414,15 +470,19 @@ impl Horizon {
         let span = tracing::Span::current();
         let url = format!("{}/transactions", self.base_url.trim_end_matches('/'));
         let http = self.http.clone();
+        // Captured here, inside the instrumented span, so retries share one parent context.
+        let trace = trace_headers();
         let xdr = envelope_xdr.to_string();
 
         let result = execute(&self.circuit, &self.retry, CallKind::Submit, || {
             let url = url.clone();
             let http = http.clone();
+            let trace = trace.clone();
             let xdr = xdr.clone();
             async move {
                 let resp = http
                     .post(&url)
+                    .headers(trace)
                     .form(&[("tx", &xdr)])
                     .timeout(SUBMIT_TIMEOUT)
                     .send()
@@ -560,6 +620,7 @@ impl Horizon {
         let resp = self
             .http
             .get(url)
+            .headers(trace_headers())
             .timeout(Duration::from_secs(3))
             .send()
             .await
@@ -570,6 +631,17 @@ impl Horizon {
             Err(format!("horizon returned HTTP {}", resp.status()))
         }
     }
+}
+
+/// Trace-context headers for the current span; empty unless trace export is enabled.
+fn trace_headers() -> reqwest::header::HeaderMap {
+    octo_resilience::trace_headers()
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).ok()?;
+            Some((name, reqwest::header::HeaderValue::from_str(&v).ok()?))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
