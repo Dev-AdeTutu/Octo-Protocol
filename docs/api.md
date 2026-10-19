@@ -83,8 +83,11 @@ decrypt. Consequently:
 ## Addresses
 
 - `POST /v1/wallets/{id}/addresses` — generate a dedicated customer address.
-  Returns `muxed_address` (`M...`) **and** the `{ base_address, memo_id }` fallback.
-- `GET  /v1/wallets/{id}/addresses` — list addresses (paginated).
+  Body: `{ "customer_ref"?: string, "metadata"?: object }`. Returns `muxed_address` (`M...`)
+  **and** the `{ base_address, memo_id }` fallback. `customer_ref` (≤ 128 characters, trimmed, no
+  control characters) is unique per wallet: reusing one on the same wallet is `409`.
+- `GET  /v1/wallets/{id}/addresses` — list addresses (paginated). `?customer_ref=` returns just
+  the address with that reference (an empty list if none).
 
 ## Gas sponsorship
 

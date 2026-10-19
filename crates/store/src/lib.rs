@@ -1002,6 +1002,22 @@ impl Store {
         Ok(row)
     }
 
+    /// Find a wallet's address by the integrator's `customer_ref` (unique per wallet, indexed).
+    pub async fn address_by_customer_ref(
+        &self,
+        wallet_id: Uuid,
+        customer_ref: &str,
+    ) -> Result<Option<Address>, StoreError> {
+        let row = sqlx::query_as::<_, Address>(
+            "SELECT * FROM addresses WHERE wallet_id = $1 AND customer_ref = $2",
+        )
+        .bind(wallet_id)
+        .bind(customer_ref)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Find the address for a given `(wallet_id, muxed_id)`, if any.
     pub async fn address_by_muxed_id(
         &self,

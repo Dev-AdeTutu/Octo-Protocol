@@ -87,6 +87,9 @@ impl From<octo_store::StoreError> for ApiError {
             octo_store::StoreError::BudgetExceeded => {
                 ApiError::TooManyRequests("daily sponsorship budget exceeded".into())
             }
+            octo_store::StoreError::DuplicateCustomerRef => {
+                ApiError::ConflictWith("customer_ref already in use for this wallet".into())
+            }
             // Database/migration errors are logged by the caller; never echoed.
             _ => ApiError::Internal,
         }
