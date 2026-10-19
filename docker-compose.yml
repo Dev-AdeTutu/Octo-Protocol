@@ -17,6 +17,42 @@ services:
       timeout: 5s
       retries: 5
 
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: octo-server
+    env_file:
+      - .env
+    environment:
+      # Default to the compose Postgres unless overridden in .env.
+      DATABASE_URL: ${DATABASE_URL:-postgres://octo:octo@db:5432/octo}
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Optional mock Horizon — `docker compose --profile mock up` — points HORIZON_URL at it.
+  mock-horizon:
+    image: stoplight/prism:5
+    container_name: octo-mock-horizon
+    command: mock -h 0.0.0.0 -p 8000 /tmp/horizon.yml
+    volumes:
+      - ./mock/horizon.yml:/tmp/horizon.yml:ro
+    ports:
+      - "8000:8000"
+    profiles: ["mock"]
+
   # Optional DB UI — `docker compose up adminer` — http://localhost:8081
   adminer:
     image: adminer:latest
