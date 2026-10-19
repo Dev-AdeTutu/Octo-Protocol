@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# `fuzz/` is a standalone cargo-fuzz crate (nightly-only, libfuzzer-sys); keep it out of
+# the workspace so `cargo build --workspace` and the MSRV resolver are unaffected.
+exclude = ["fuzz"]
 members = [
     "crates/crypto",
     "crates/wallet-core",
