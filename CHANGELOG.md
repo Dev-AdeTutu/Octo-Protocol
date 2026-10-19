@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Optional OTLP/HTTP span export behind the `otel` cargo feature and
+  `OTEL_EXPORTER_OTLP_ENDPOINT` (both off by default), with `traceparent` propagation to
+  Horizon and sensitive span fields dropped before export (#468). See `docs/tracing.md`.
 - Prometheus `/metrics` on a separate, opt-in listener (token required off loopback): HTTP
   latency histograms, circuit-breaker state, webhook outcomes and ingest tick/lag series, all
   with bounded label cardinality (#467). See `docs/metrics.md`.

@@ -1853,6 +1853,8 @@ dependencies = [
  "octo-store",
  "octo-wallet-core",
  "octo-webhooks",
+ "reqwest",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",

@@ -6,9 +6,14 @@
 //
 // `octo-server verify-audit-chain [--user <uuid>]` instead verifies the audit hash chain and
 // exits non-zero if any chain is broken (needs only DATABASE_URL and AUDIT_CHAIN_KEY).
+//
+// Built with `--features otel`, spans can be exported over OTLP (see `telemetry.rs`).
 #![forbid(unsafe_code)]
 
 mod mainnet_guard;
+#[cfg(feature = "otel")]
+mod otlp;
+mod telemetry;
 
 use anyhow::{Context, Result};
 use octo_api::rate_limit::{RateLimitBackend, RateLimiter};
@@ -29,32 +34,69 @@ use zeroize::Zeroizing;
 fn main() -> Result<()> {
     // Load .env if present (no-op in production where env is set directly).
     let _ = dotenvy::dotenv();
-    init_tracing();
-
-    // Migrator-role entry point: needs only DATABASE_URL, never the app's secrets.
-    if std::env::args().nth(1).as_deref() == Some("--migrate-only") {
-        let url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
-        return runtime()?.block_on(async {
-            let store = Store::connect(&url).await.context("connect to database")?;
-            store.migrate().await.context("run migrations")?;
-            tracing::info!("migrations applied; exiting (--migrate-only)");
-            Ok(())
-        });
-    }
 
     // Config (and so every secret) is read and scrubbed from the environment *before* the runtime
     // starts any threads: removing env vars is only sound while nothing else can be reading them.
-    if std::env::args().nth(1).as_deref() == Some("verify-audit-chain") {
-        let cfg = VerifyConfig::from_env()?;
-        return runtime()?.block_on(verify_audit_chain(cfg));
+    let telemetry_cfg = telemetry::TelemetryConfig::from_env()?;
+    // The global subscriber may export over OTLP, which needs the runtime; log locally until then.
+    let command =
+        tracing::subscriber::with_default(telemetry::boot_subscriber(), Command::from_env)?;
+
+    let runtime = runtime()?;
+    // Entered only for setup: the span exporter spawns its task onto this runtime.
+    let telemetry = {
+        let _entered = runtime.enter();
+        telemetry::init(telemetry_cfg)?
+    };
+    runtime.block_on(async {
+        let result = command.run().await;
+        telemetry.shutdown().await;
+        result
+    })
+}
+
+/// What this invocation does, decided (and its config read) before the runtime exists.
+enum Command {
+    /// `--migrate-only`: migrator-role entry point; needs only DATABASE_URL, never app secrets.
+    MigrateOnly { database_url: String },
+    /// `verify-audit-chain [--user <uuid>]`.
+    VerifyAuditChain(VerifyConfig),
+    Serve(Config),
+}
+
+impl Command {
+    fn from_env() -> Result<Command> {
+        match std::env::args().nth(1).as_deref() {
+            Some("--migrate-only") => Ok(Command::MigrateOnly {
+                database_url: std::env::var("DATABASE_URL").context("DATABASE_URL is required")?,
+            }),
+            Some("verify-audit-chain") => Ok(Command::VerifyAuditChain(VerifyConfig::from_env()?)),
+            _ => {
+                let cfg = Config::from_env()?;
+                // Fail closed before touching the DB; exit directly so the operator sees one line.
+                if let Err(e) = cfg.ensure_safe_for_network() {
+                    tracing::error!(network = cfg.network.as_str(), "{e}");
+                    std::process::exit(1);
+                }
+                Ok(Command::Serve(cfg))
+            }
+        }
     }
-    let cfg = Config::from_env()?;
-    // Fail closed before touching the DB; exit directly so the operator sees exactly one fatal line.
-    if let Err(e) = cfg.ensure_safe_for_network() {
-        tracing::error!(network = cfg.network.as_str(), "{e}");
-        std::process::exit(1);
+
+    async fn run(self) -> Result<()> {
+        match self {
+            Command::MigrateOnly { database_url } => {
+                let store = Store::connect(&database_url)
+                    .await
+                    .context("connect to database")?;
+                store.migrate().await.context("run migrations")?;
+                tracing::info!("migrations applied; exiting (--migrate-only)");
+                Ok(())
+            }
+            Command::VerifyAuditChain(cfg) => verify_audit_chain(cfg).await,
+            Command::Serve(cfg) => serve(cfg).await,
+        }
     }
-    runtime()?.block_on(serve(cfg))
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
@@ -460,13 +502,6 @@ impl VerifyConfig {
             user,
         })
     }
-}
-
-fn init_tracing() {
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info,octo=debug".to_string());
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .init();
 }
 
 /// Server configuration, read from environment variables.
