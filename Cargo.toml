@@ -14,6 +14,8 @@ members = [
     "bin/server",
     "bin/migrate-keys",
     "bin/backfill-operation-index",
+    "bin/seed",
+    "crates/mock-horizon",
 ]
 
 [workspace.package]

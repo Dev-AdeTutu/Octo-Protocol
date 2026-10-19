@@ -27,5 +27,39 @@ services:
       - db
     profiles: ["tools"]
 
+  # Optional seed runner — `docker compose --profile tools run seed`
+  # Produces demo users, wallets and deposits against the local testnet config.
+  # Refuses to run against mainnet configs (see seed binary).
+  seed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: octo-seed
+    command: ["seed"]
+    environment:
+      DATABASE_URL: postgres://octo:octo@db:5432/octo
+      STELLAR_NETWORK: testnet
+      HORIZON_URL: http://horizon-mock:8000
+      APP_ENV: local
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["tools"]
+
+  # Optional offline mock Horizon — `docker compose --profile tools up horizon-mock`
+  # Serves scripted accounts, payments and submit responses for offline development.
+  horizon-mock:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: octo-horizon-mock
+    command: ["horizon-mock"]
+    environment:
+      HORIZON_MOCK_ADDR: 0.0.0.0:8000
+      HORIZON_MOCK_FIXTURES: /app/fixtures/horizon
+    ports:
+      - "8000:8000"
+    profiles: ["tools"]
+
 volumes:
   octo_pgdata:

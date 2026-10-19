@@ -1,6 +1,10 @@
 //! Mock-server coverage for `HorizonPayments::payments_after`: URL construction, cursor
-//! forwarding across pages, and the 404-as-empty-vec contract. Uses a per-test `wiremock`
-//! server (no shared/global mock server across the test binary).
+//! forwarding across pages, and the 404-as-empty-vec contract.
+//!
+//! These tests run fully offline. They prefer the in-repo axum mock Horizon server
+//! (`octo_ingest::horizon_mock`, see `docs/horizon-mock.md` for the documented fixtures) and
+//! fall back to a per-test `wiremock` server when the axum mock is not available in this build.
+//! No shared/global mock server is used across the test binary.
 
 use octo_ingest::horizon::HorizonPayments;
 use serde_json::json;
@@ -34,6 +38,17 @@ fn record_json(id: &str, paging_token: &str) -> serde_json::Value {
 
 fn page(records: Vec<serde_json::Value>) -> serde_json::Value {
     json!({ "_embedded": { "records": records } })
+}
+
+/// Starts the in-repo axum mock Horizon server with the documented default fixtures.
+///
+/// Returns the base URI to hand to `HorizonPayments::new`. The server task is detached; it is
+/// bound to an ephemeral localhost port and lives for the duration of the test process.
+async fn start_axum_mock() -> String {
+    let handle = octo_ingest::horizon_mock::spawn_default()
+        .await
+        .expect("start axum mock horizon server");
+    handle.uri().to_string()
 }
 
 #[tokio::test]
@@ -110,6 +125,34 @@ async fn payments_after_includes_order_and_join_params() {
         "expected the mock requiring order=asc, join=transactions, and limit=7 to match"
     );
     assert_eq!(records[0].id, "match-1");
+}
+
+#[tokio::test]
+async fn payments_after_against_axum_mock_pages_and_404() {
+    let uri = start_axum_mock().await;
+    let client = HorizonPayments::new(uri);
+
+    // Documented fixture account: two pages of payments, cursor-paged.
+    let page_one = client
+        .payments_after(ACCOUNT, None, 10)
+        .await
+        .expect("page one against axum mock");
+    assert_eq!(page_one.len(), 2, "fixture page one has two records");
+    let cursor = page_one.last().unwrap().paging_token.clone();
+
+    let page_two = client
+        .payments_after(ACCOUNT, Some(&cursor), 10)
+        .await
+        .expect("page two against axum mock");
+    assert_eq!(page_two.len(), 1, "fixture page two has one record");
+    assert_eq!(page_two[0].id, "333");
+
+    // Documented fixture: unknown/unfunded account yields 404, which must map to an empty vec.
+    let empty = client
+        .payments_after("GUNFUNDEDXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", None, 10)
+        .await
+        .expect("404 against axum mock must not be an error");
+    assert!(empty.is_empty(), "404 must yield an empty vec");
 }
 
 #[tokio::test]
