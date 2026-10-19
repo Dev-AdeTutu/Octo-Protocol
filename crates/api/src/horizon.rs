@@ -179,6 +179,39 @@ struct ResultCodes {
     operations: Vec<String>,
 }
 
+/// The result of looking a transaction up by hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxLookup {
+    /// Horizon has ingested the transaction; `successful` is its on-chain result.
+    Found { successful: bool, ledger: Option<i64> },
+    /// Horizon has no record of the hash (never submitted, expired, or not yet ingested).
+    NotFound,
+}
+
+#[derive(Debug, Deserialize)]
+struct TxRecord {
+    #[serde(default)]
+    successful: bool,
+    #[serde(default)]
+    ledger: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LedgerPage {
+    #[serde(rename = "_embedded")]
+    embedded: LedgerRecords,
+}
+
+#[derive(Debug, Deserialize)]
+struct LedgerRecords {
+    records: Vec<LedgerRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LedgerRecord {
+    closed_at: String,
+}
+
 /// A thin Horizon client with retry/backoff and circuit-breaker protection.
 ///
 /// The circuit breaker and retry policy are shared across all calls through this client instance
@@ -509,6 +542,76 @@ impl Horizon {
             )),
             Err(ResilienceError::Exhausted(_)) => Err(ApiError::Internal),
         }
+    }
+
+    /// Look a transaction up by its hash. Retried on transient failures; a 404 is a settled
+    /// `NotFound` answer, not an error. This is the "query the ledger" path that
+    /// [`octo_resilience`] prescribes after an ambiguous submit.
+    pub async fn transaction_by_hash(&self, hash: &str) -> Result<TxLookup, ApiError> {
+        // The hash is interpolated into a URL path; only a 32-byte hex digest is acceptable.
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ApiError::BadRequest("transaction hash is malformed".into()));
+        }
+        let url = format!(
+            "{}/transactions/{}",
+            self.base_url.trim_end_matches('/'),
+            hash
+        );
+        let http = self.http.clone();
+        let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
+            let (url, http) = (url.clone(), http.clone());
+            async move {
+                let resp = http.get(&url).send().await.map_err(|_| FetchError::Transport)?;
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Err(FetchError::NotFound);
+                }
+                if resp.status().is_server_error() {
+                    return Err(FetchError::Transport);
+                }
+                if !resp.status().is_success() {
+                    return Err(FetchError::Permanent);
+                }
+                resp.json::<TxRecord>().await.map_err(|_| FetchError::Permanent)
+            }
+        })
+        .await;
+        match result {
+            Ok(r) => Ok(TxLookup::Found {
+                successful: r.successful,
+                ledger: r.ledger,
+            }),
+            Err(ResilienceError::Exhausted(FetchError::NotFound)) => Ok(TxLookup::NotFound),
+            Err(_) => Err(ApiError::Internal),
+        }
+    }
+
+    /// Close time (unix seconds) of Horizon's newest ingested ledger. A transaction missing from
+    /// Horizon whose `max_time` precedes this can never be applied.
+    pub async fn latest_ledger_close_time(&self) -> Result<i64, ApiError> {
+        let url = format!(
+            "{}/ledgers?order=desc&limit=1",
+            self.base_url.trim_end_matches('/')
+        );
+        let http = self.http.clone();
+        let result = execute(&self.circuit, &self.retry, CallKind::ReadOnly, || {
+            let (url, http) = (url.clone(), http.clone());
+            async move {
+                let resp = http.get(&url).send().await.map_err(|_| FetchError::Transport)?;
+                if resp.status().is_server_error() {
+                    return Err(FetchError::Transport);
+                }
+                if !resp.status().is_success() {
+                    return Err(FetchError::Permanent);
+                }
+                let page: LedgerPage = resp.json().await.map_err(|_| FetchError::Permanent)?;
+                let closed_at = page.embedded.records.first().ok_or(FetchError::Permanent)?;
+                chrono::DateTime::parse_from_rfc3339(&closed_at.closed_at)
+                    .map(|t| t.timestamp())
+                    .map_err(|_| FetchError::Permanent)
+            }
+        })
+        .await;
+        map_result(result)
     }
 
     // Probe Horizon root endpoint to verify node reachability.

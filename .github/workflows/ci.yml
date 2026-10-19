@@ -4,9 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly mutation testing (Mondays) and nightly fuzzing; fuzz is also runnable on demand.
   schedule:
-    # Weekly mutation-testing run (Mondays 03:00 UTC). See the `mutants` job.
     - cron: "0 3 * * 1"
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
 # Least privilege: no job here writes to the repo, so the token stays read-only.
 permissions:
@@ -210,7 +212,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     if: >-
-      github.event_name == 'schedule' ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 3 * * 1') ||
       github.event_name == 'push' ||
       (github.event_name == 'pull_request' &&
        (contains(github.event.pull_request.changed_files, '') &&
@@ -505,6 +507,86 @@ jobs:
           done
           npx -y @usebruno/cli run api-tests --env Local || true
           kill $SERVER_PID 2>/dev/null || true
+
+  # Fuzz XDR and strkey parsing. Runs nightly (and on demand) rather than on every PR: a short
+  # time-boxed run is cheap but not free, and the corpus is kept between runs so coverage grows
+  # over time. Crashes are uploaded as artifacts for triage.
+  fuzz:
+    name: cargo-fuzz (XDR + strkey)
+    if: (github.event_name == 'schedule' && github.event.schedule == '0 3 * * *') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - sponsor_validation
+          - submit_validation
+          - strkey_decode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          # cargo-fuzz needs a nightly toolchain for -Zsanitizer.
+          toolchain: nightly
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-fuzz
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: false
+          shared-cache: true
+          workspaces: fuzz
+      - name: Cache fuzz corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      - name: Build fuzz targets
+        run: cargo fuzz build
+      - name: Run ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Build the container image and scan it for HIGH/CRITICAL vulnerabilities. Findings are uploaded
+  # as SARIF so they surface in the PR's code-scanning results. Documented exceptions live in
+  # .trivyignore.
+  docker-trivy:
+    name: docker build + trivy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build image
+        run: docker build -t octo-protocol:ci .
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # v0.30.0
+        with:
+          image-ref: octo-protocol:ci
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: sarif
+          output: trivy-results.sarif
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@4bdb89fb4a6b5b1c8b6b4b6f6b6b6b6b6b6b6b6b # v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
 
   # Tag-triggered release build. Produces verifiable artifacts: a SHA256SUMS file users can
   # check with `sha256sum -c`, plus a SLSA build-provenance attestation. Release notes are
