@@ -83,6 +83,23 @@ pub struct NewWithdrawal<'a> {
     pub memo_id: Option<i64>,
 }
 
+/// An outbound transfer to record in the `transactions` history.
+pub struct NewWithdrawalTransaction<'a> {
+    pub wallet_id: Uuid,
+    pub asset_code: &'a str,
+    pub asset_issuer: Option<&'a str>,
+    pub amount_stroops: i64,
+    pub source_account: &'a str,
+    pub destination_account: &'a str,
+    pub stellar_tx_hash: Option<&'a str>,
+    /// `pending` before submission, then `confirmed` / `failed` once the outcome is known.
+    pub status: &'a str,
+    pub ledger: Option<i64>,
+    /// The transaction's timebound upper limit (unix seconds), kept so the reconciler can tell
+    /// an expired transaction from one that may still land.
+    pub max_time: Option<i64>,
+}
+
 impl Store {
     /// Connect to Postgres at `database_url` with [`StoreConfig::default`].
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
@@ -1215,45 +1232,97 @@ impl Store {
         Ok(found.is_some())
     }
 
-    /// Create a withdrawal intent. Idempotent on `(wallet_id, idempotency_key)`: a retried request
-    /// with the same key returns [`StoreError::Conflict`] instead of creating a second payout.
-    /// Record a confirmed/failed outbound transfer in the `transactions` history (the table the
-    /// dashboard lists). Withdrawals previously lived only in `withdrawals`, which is why they
-    /// never showed up in "recent transactions".
-    #[allow(clippy::too_many_arguments)]
+    /// Record an outbound transfer in the `transactions` history (the table the dashboard
+    /// lists). Idempotent per `(wallet_id, tx hash)`: a repeat call only advances a row that is
+    /// still `pending`, so a settled outcome is never overwritten. Returns `None` when the row
+    /// already existed in a final state.
     pub async fn record_withdrawal_transaction(
         &self,
-        wallet_id: Uuid,
-        asset_code: &str,
-        asset_issuer: Option<&str>,
-        amount_stroops: i64,
-        source_account: &str,
-        destination_account: &str,
-        stellar_tx_hash: Option<&str>,
-        status: &str,
-    ) -> Result<Transaction, StoreError> {
+        new: NewWithdrawalTransaction<'_>,
+    ) -> Result<Option<Transaction>, StoreError> {
         let row = sqlx::query_as::<_, Transaction>(
             r#"
             INSERT INTO transactions
                 (wallet_id, direction, asset_code, asset_issuer, amount_stroops,
-                 source_account, destination_account, stellar_tx_hash, status)
-            VALUES ($1, 'withdrawal', $2, $3, $4, $5, $6, $7, $8)
+                 source_account, destination_account, stellar_tx_hash, status, ledger, metadata)
+            VALUES ($1, 'withdrawal', $2, $3, $4, $5, $6, $7, $8, $9,
+                    CASE WHEN $10::bigint IS NULL THEN '{}'::jsonb
+                         ELSE jsonb_build_object('max_time', $10::bigint) END)
+            ON CONFLICT (wallet_id, stellar_tx_hash)
+                WHERE stellar_tx_hash IS NOT NULL AND direction = 'withdrawal'
+            DO UPDATE SET status = EXCLUDED.status,
+                          ledger = COALESCE(EXCLUDED.ledger, transactions.ledger)
+                WHERE transactions.status = 'pending'
             RETURNING *
             "#,
         )
-        .bind(wallet_id)
-        .bind(asset_code)
-        .bind(asset_issuer)
-        .bind(amount_stroops)
-        .bind(source_account)
-        .bind(destination_account)
-        .bind(stellar_tx_hash)
-        .bind(status)
-        .fetch_one(&self.pool)
+        .bind(new.wallet_id)
+        .bind(new.asset_code)
+        .bind(new.asset_issuer)
+        .bind(new.amount_stroops)
+        .bind(new.source_account)
+        .bind(new.destination_account)
+        .bind(new.stellar_tx_hash)
+        .bind(new.status)
+        .bind(new.ledger)
+        .bind(new.max_time)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
 
+    /// Withdrawal history rows still `pending` after `older_than`, oldest first.
+    pub async fn list_stale_pending_withdrawals(
+        &self,
+        older_than: std::time::Duration,
+        limit: i64,
+    ) -> Result<Vec<Transaction>, StoreError> {
+        let rows = sqlx::query_as::<_, Transaction>(
+            r#"
+            SELECT * FROM transactions
+            WHERE direction = 'withdrawal' AND status = 'pending'
+              AND created_at < now() - make_interval(secs => $1)
+            ORDER BY created_at
+            LIMIT $2
+            "#,
+        )
+        .bind(older_than.as_secs_f64())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Move a `pending` withdrawal row to its final `status`. Returns `false` when the row was
+    /// already settled, which makes concurrent or repeated reconciler runs harmless.
+    pub async fn settle_pending_withdrawal(
+        &self,
+        id: Uuid,
+        status: &str,
+        ledger: Option<i64>,
+        reason: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = $2,
+                ledger = COALESCE($3, ledger),
+                metadata = CASE WHEN $4::text IS NULL THEN metadata
+                                ELSE metadata || jsonb_build_object('reconcile_reason', $4::text) END
+            WHERE id = $1 AND direction = 'withdrawal' AND status = 'pending'
+            "#,
+        )
+        .bind(id)
+        .bind(status)
+        .bind(ledger)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Create a withdrawal intent. Idempotent on `(wallet_id, idempotency_key)`: a retried request
+    /// with the same key returns [`StoreError::Conflict`] instead of creating a second payout.
     pub async fn create_withdrawal(
         &self,
         new: NewWithdrawal<'_>,
@@ -1371,6 +1440,26 @@ impl Store {
         .fetch_one(&self.pool)
         .await
         .map_err(StoreError::Database)
+    }
+
+    /// Mark sponsored transactions stuck `pending` longer than `older_than` as failed.
+    pub async fn reconcile_stale_pending_sponsorships(
+        &self,
+        older_than: std::time::Duration,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE sponsored_transactions
+            SET status = 'failed', error = COALESCE(error, 'timed out pending confirmation')
+            WHERE status = 'pending'
+              AND created_at < now() - make_interval(secs => $1)
+            "#,
+        )
+        .bind(older_than.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
     }
 
     /// Sum of sponsored fees reserved (pending + confirmed) for a wallet so far today (UTC).
