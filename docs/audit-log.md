@@ -11,6 +11,14 @@ The table is **append-only at the database level** (migration `0026_audit_logs_a
 `octo_audit_retention`, or the delete is the `ON DELETE CASCADE` from a user row that is already
 gone. See [postgres-roles.md](postgres-roles.md) for who holds that role.
 
+**Account deletion** (migration `0032_account_deletion.sql`) is the one other edit allowed: once
+a user is tombstoned (`users.deleted_at` set), their rows may have `target` and `ip_address`
+nulled and their chain hashes rewritten — no other column may change. `Store::delete_account`
+first re-verifies every row against its existing hash and refuses (`AuditChainCorrupt`) rather
+than re-sign a tampered chain, then re-links the anonymised rows and head under the same key, so
+the chain still verifies afterwards. A DB-only attacker can use this exception to null fields,
+but not to produce hashes that verify.
+
 ## Tamper evidence (hash chain)
 
 Each user's rows form an HMAC-SHA256 chain (migration `0029_audit_hash_chain.sql`, code in

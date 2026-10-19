@@ -185,7 +185,7 @@ pub struct AuthenticatedSession {
 ///
 /// Blunts credential stuffing and signup spam. Deliberately per-IP rather than per-email — an
 /// attacker rotates emails freely, but not source addresses.
-async fn check_auth_rate_limit(
+pub(crate) async fn check_auth_rate_limit(
     state: &AppState,
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
@@ -211,7 +211,7 @@ async fn check_auth_rate_limit(
 
 /// Generate, store, and email a one-time code for `purpose`. `bound_to` ties the code to one value
 /// (e.g. a new email address) so it can't be redeemed for anything else.
-async fn issue_otp(
+pub(crate) async fn issue_otp(
     state: &AppState,
     user_id: Uuid,
     purpose: &str,
@@ -1022,7 +1022,7 @@ fn hash_password(password: &str) -> Result<String, ApiError> {
         .map_err(|_| ApiError::Internal)
 }
 
-fn verify_password(password: &str, phc: &str) -> Result<(), ()> {
+pub(crate) fn verify_password(password: &str, phc: &str) -> Result<(), ()> {
     let parsed = PasswordHash::new(phc).map_err(|_| ())?;
     configured_argon2().map_err(|_| ())?
         .verify_password(password.as_bytes(), &parsed)

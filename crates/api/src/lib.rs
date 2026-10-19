@@ -12,15 +12,17 @@ mod json;
 pub mod rate_limit;
 pub mod routes;
 pub mod self_test;
+pub mod signing_policy;
 pub mod sponsor_validation;
 mod state;
 pub mod submit_validation;
 pub mod validation;
 
 pub use error::{ApiError, ApiResult, Envelope};
+pub use signing_policy::SigningPolicy;
 pub use state::AppState;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::header::{self, HeaderName};
 use axum::http::{Method, StatusCode};
 use axum::http::HeaderValue;
@@ -65,6 +67,39 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
         response.headers_mut().insert(REQUEST_ID_HEADER.clone(), val);
     }
 
+    response
+}
+
+/// Record request latency for `/metrics`. Labels use the matched route *template*, never the raw
+/// path, and fixed method/status buckets, so cardinality stays bounded whatever clients send.
+async fn http_metrics_middleware(req: Request, next: Next) -> Response {
+    let method = match *req.method() {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::OPTIONS => "OPTIONS",
+        Method::HEAD => "HEAD",
+        _ => "other",
+    };
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| "unmatched".to_string(), |p| p.as_str().to_string());
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+    let status_class = match response.status().as_u16() {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        _ => "5xx",
+    };
+    octo_metrics::HTTP_REQUEST_DURATION.observe(
+        &[method, &route, status_class],
+        started.elapsed().as_secs_f64(),
+    );
     response
 }
 
@@ -142,6 +177,7 @@ pub fn build_router(state: AppState) -> Router {
             header::CONTENT_TYPE,
             header::ACCEPT,
             REQUEST_ID_HEADER.clone(),
+            HeaderName::from_static("idempotency-key"),
         ]);
 
     // NOTE: the body-limit layer used to be applied here, to an *empty* router — layers only
@@ -171,6 +207,22 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/me", get(auth::me).patch(auth::update_username))
         .route("/v1/auth/logout", post(auth::logout))
         .route("/v1/auth/change-password", post(auth::change_password))
+        // Account export/deletion (password + emailed OTP); under /v1/auth/ for no-store.
+        .route(
+            "/v1/auth/account/export/request-otp",
+            post(routes::account::export_request_otp),
+        )
+        .route("/v1/auth/account/export", post(routes::account::export_account))
+        .route(
+            "/v1/auth/account/delete/request-otp",
+            post(routes::account::delete_request_otp)
+                .layer(middleware::from_fn(outbound_route_timeout)),
+        )
+        .route(
+            "/v1/auth/account/delete",
+            post(routes::account::delete_account)
+                .layer(middleware::from_fn(outbound_route_timeout)),
+        )
         .route("/v1/auth/sessions", get(routes::sessions::list_sessions))
         // Static segment takes priority over the :id capture below (matchit routing).
         .route(
@@ -201,6 +253,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/wallets/:id/archive", patch(routes::wallets::archive_wallet))
         .route("/v1/wallets/:id/unarchive", patch(routes::wallets::unarchive_wallet))
+        .route("/v1/wallets/:id/ingest/pause", patch(routes::wallets::pause_ingest))
+        .route("/v1/wallets/:id/ingest/resume", patch(routes::wallets::resume_ingest))
         .route(
             "/v1/wallets/:id/balances",
             get(routes::wallets::get_balances)
@@ -209,6 +263,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/wallets/:id/transactions",
             get(routes::wallets::list_transactions),
+        )
+        .route(
+            "/v1/wallets/:id/transactions.csv",
+            get(routes::transactions_csv::export_transactions_csv),
         )
         .route(
             "/v1/wallets/:id/addresses",
@@ -339,6 +397,8 @@ pub fn build_router(state: AppState) -> Router {
         // needed. tower_http's RequestBodyLimitLayer would require one and does not compose
         // cleanly with `Router::layer` here.
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
+        // Innermost of the middleware below, so it sees the MatchedPath set by routing.
+        .layer(middleware::from_fn(http_metrics_middleware))
         .layer(cors)
         .layer(middleware::from_fn(security_headers_middleware))
         .layer(middleware::from_fn(secret_response_cache_middleware))

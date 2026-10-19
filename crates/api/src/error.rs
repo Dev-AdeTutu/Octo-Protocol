@@ -37,6 +37,8 @@ pub enum ApiError {
     Internal,
     /// 504 — an upstream dependency (e.g. Horizon) did not answer within the route's time budget.
     GatewayTimeout(String),
+    /// 503 — a dependency needed to make a safe decision (e.g. Horizon) is unavailable.
+    ServiceUnavailable(String),
 }
 
 impl ApiError {
@@ -56,6 +58,7 @@ impl ApiError {
                 "internal server error".into(),
             ),
             ApiError::GatewayTimeout(m) => (StatusCode::GATEWAY_TIMEOUT, m.clone()),
+            ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m.clone()),
         }
     }
 }
@@ -114,7 +117,6 @@ impl From<octo_wallet_core::WalletError> for ApiError {
             ),
             W::StaleSequence => ApiError::StaleSequence(
                 "Stale sequence number — refresh signing info and rebuild the transaction.".into(),
-            ),
             ),
             W::KeyDerivation | W::Signing | W::SeedDecryption => ApiError::Internal,
         }

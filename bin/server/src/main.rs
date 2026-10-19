@@ -6,13 +6,21 @@
 //
 // `octo-server verify-audit-chain [--user <uuid>]` instead verifies the audit hash chain and
 // exits non-zero if any chain is broken (needs only DATABASE_URL and AUDIT_CHAIN_KEY).
+//
+// `octo-server --check-config` validates the environment and database, prints a redacted
+// summary and exits non-zero on any problem. Built with `--features otel`, spans can be exported
+// over OTLP (see `telemetry.rs`).
 #![forbid(unsafe_code)]
 
+mod check_config;
 mod mainnet_guard;
+#[cfg(feature = "otel")]
+mod otlp;
+mod telemetry;
 
 use anyhow::{Context, Result};
 use octo_api::rate_limit::{RateLimitBackend, RateLimiter};
-use octo_api::{build_router, AppState};
+use octo_api::{build_router, AppState, SigningPolicy};
 use octo_email::EmailSender;
 use octo_ingest::Supervisor;
 use octo_resilience::ResilienceConfig;
@@ -29,32 +37,79 @@ use zeroize::Zeroizing;
 fn main() -> Result<()> {
     // Load .env if present (no-op in production where env is set directly).
     let _ = dotenvy::dotenv();
-    init_tracing();
-
-    // Migrator-role entry point: needs only DATABASE_URL, never the app's secrets.
-    if std::env::args().nth(1).as_deref() == Some("--migrate-only") {
-        let url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
-        return runtime()?.block_on(async {
-            let store = Store::connect(&url).await.context("connect to database")?;
-            store.migrate().await.context("run migrations")?;
-            tracing::info!("migrations applied; exiting (--migrate-only)");
-            Ok(())
-        });
-    }
 
     // Config (and so every secret) is read and scrubbed from the environment *before* the runtime
     // starts any threads: removing env vars is only sound while nothing else can be reading them.
-    if std::env::args().nth(1).as_deref() == Some("verify-audit-chain") {
-        let cfg = VerifyConfig::from_env()?;
-        return runtime()?.block_on(verify_audit_chain(cfg));
+    let telemetry_cfg = telemetry::TelemetryConfig::from_env()?;
+    // The global subscriber may export over OTLP, which needs the runtime; log locally until then.
+    let command = tracing::subscriber::with_default(telemetry::boot_subscriber(), || {
+        Command::from_env(&telemetry_cfg)
+    })?;
+
+    let runtime = runtime()?;
+    // Entered only for setup: the span exporter spawns its task onto this runtime.
+    let telemetry = {
+        let _entered = runtime.enter();
+        telemetry::init(telemetry_cfg)?
+    };
+    runtime.block_on(async {
+        let result = command.run().await;
+        telemetry.shutdown().await;
+        result
+    })
+}
+
+/// What this invocation does, decided (and its config read) before the runtime exists.
+enum Command {
+    /// `--migrate-only`: migrator-role entry point; needs only DATABASE_URL, never app secrets.
+    MigrateOnly { database_url: String },
+    /// `verify-audit-chain [--user <uuid>]`.
+    VerifyAuditChain(VerifyConfig),
+    /// `--check-config`: validate everything `serve` needs, print a redacted summary, exit.
+    CheckConfig(Config, check_config::Summary),
+    Serve(Config),
+}
+
+impl Command {
+    fn from_env(telemetry: &telemetry::TelemetryConfig) -> Result<Command> {
+        match std::env::args().nth(1).as_deref() {
+            Some("--migrate-only") => Ok(Command::MigrateOnly {
+                database_url: std::env::var("DATABASE_URL").context("DATABASE_URL is required")?,
+            }),
+            Some("verify-audit-chain") => Ok(Command::VerifyAuditChain(VerifyConfig::from_env()?)),
+            // A config error surfaces here as a non-zero exit, before anything connects.
+            Some("--check-config") => {
+                let cfg = Config::from_env()?;
+                let summary = check_config::Summary::new(&cfg, telemetry);
+                Ok(Command::CheckConfig(cfg, summary))
+            }
+            _ => {
+                let cfg = Config::from_env()?;
+                // Fail closed before touching the DB; exit directly so the operator sees one line.
+                if let Err(e) = cfg.ensure_safe_for_network() {
+                    tracing::error!(network = cfg.network.as_str(), "{e}");
+                    std::process::exit(1);
+                }
+                Ok(Command::Serve(cfg))
+            }
+        }
     }
-    let cfg = Config::from_env()?;
-    // Fail closed before touching the DB; exit directly so the operator sees exactly one fatal line.
-    if let Err(e) = cfg.ensure_safe_for_network() {
-        tracing::error!(network = cfg.network.as_str(), "{e}");
-        std::process::exit(1);
+
+    async fn run(self) -> Result<()> {
+        match self {
+            Command::MigrateOnly { database_url } => {
+                let store = Store::connect(&database_url)
+                    .await
+                    .context("connect to database")?;
+                store.migrate().await.context("run migrations")?;
+                tracing::info!("migrations applied; exiting (--migrate-only)");
+                Ok(())
+            }
+            Command::VerifyAuditChain(cfg) => verify_audit_chain(cfg).await,
+            Command::CheckConfig(cfg, summary) => check_config::run(cfg, summary).await,
+            Command::Serve(cfg) => serve(cfg).await,
+        }
     }
-    runtime()?.block_on(serve(cfg))
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
@@ -104,6 +159,9 @@ async fn serve(cfg: Config) -> Result<()> {
 
     // Shared state (includes the API's Horizon client wired with resilience).
     let email = EmailSender::new(cfg.resend_api_key.clone(), cfg.email_from_address.clone());
+    // One breaker per client; clones share state, so `/metrics` reads the live one.
+    let api_circuit = resilience.circuit_breaker();
+    register_breaker_gauge("horizon_api", api_circuit.clone());
     let mut state = AppState::new_with_resilience(
         store.clone(),
         cfg.master_key,
@@ -113,8 +171,9 @@ async fn serve(cfg: Config) -> Result<()> {
         cfg.public_app_url.clone(),
         email,
         resilience.retry_policy(),
-        resilience.circuit_breaker(),
+        api_circuit,
     )
+    .with_signing_policy(cfg.signing_policy)
     .with_jwt_secret(cfg.jwt_secret.clone())
     .with_audit_chain_key(cfg.audit_chain_key.clone())
     .with_public_api_url(cfg.public_api_url.as_deref())
@@ -140,6 +199,7 @@ async fn serve(cfg: Config) -> Result<()> {
     // independently).
     let ingest_retry = cfg.resilience.retry_policy();
     let ingest_circuit = cfg.resilience.circuit_breaker();
+    register_breaker_gauge("horizon_ingest", ingest_circuit.clone());
     let supervisor = Supervisor::new_with_resilience(
         store.clone(),
         cfg.horizon_url.clone(),
@@ -197,7 +257,7 @@ async fn serve(cfg: Config) -> Result<()> {
         }
     });
 
-    // Hourly prune of expired deny-list entries and sessions, so neither table grows unbounded.
+    // Hourly prune of expired deny-list entries, sessions and idempotency keys (bounded tables).
     let purge_store = store.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
@@ -209,8 +269,32 @@ async fn serve(cfg: Config) -> Result<()> {
             if let Err(e) = purge_store.purge_expired_sessions().await {
                 tracing::warn!(error = ?e, "failed to purge expired sessions");
             }
+            if let Err(e) = purge_store.purge_expired_idempotency_keys().await {
+                tracing::warn!(error = ?e, "failed to purge expired idempotency keys");
+            }
         }
     });
+
+    // Metrics get their own listener, so `/metrics` is never reachable via the public API port.
+    if let Some(metrics) = cfg.metrics.clone() {
+        let listener = tokio::net::TcpListener::bind(&metrics.bind_addr)
+            .await
+            .with_context(|| format!("bind metrics listener {}", metrics.bind_addr))?;
+        tracing::info!(
+            addr = %metrics.bind_addr,
+            token_required = metrics.token.is_some(),
+            "metrics listening"
+        );
+        let metrics_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let served = axum::serve(listener, metrics_router(metrics.token))
+                .with_graceful_shutdown(metrics_shutdown.cancelled_owned())
+                .await;
+            if let Err(e) = served {
+                tracing::error!(error = ?e, "metrics listener failed");
+            }
+        });
+    }
 
     // REST API.
     let app = build_router(state);
@@ -274,6 +358,55 @@ async fn serve(cfg: Config) -> Result<()> {
     }
     tracing::info!("exiting");
     Ok(())
+}
+
+/// Expose a breaker as `octo_circuit_breaker_state{breaker}`: 0 closed, 1 half-open, 2 open.
+fn register_breaker_gauge(breaker: &'static str, circuit: octo_resilience::CircuitBreaker) {
+    octo_metrics::register_gauge_fn(
+        "octo_circuit_breaker_state",
+        "Circuit breaker state: 0 closed, 1 half-open, 2 open.",
+        &[("breaker", breaker)],
+        move || match (circuit.is_closed(), circuit.is_open()) {
+            (true, _) => 0.0,
+            (false, true) => 2.0,
+            (false, false) => 1.0,
+        },
+    );
+}
+
+/// `GET /metrics`, optionally behind `Authorization: Bearer <METRICS_TOKEN>`.
+fn metrics_router(token: Option<Zeroizing<String>>) -> axum::Router {
+    use axum::http::{header, HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    let token = std::sync::Arc::new(token);
+    axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move |headers: HeaderMap| {
+            let token = token.clone();
+            async move {
+                if let Some(expected) = token.as_ref() {
+                    let presented = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .unwrap_or("");
+                    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                }
+                (
+                    [(header::CONTENT_TYPE, octo_metrics::CONTENT_TYPE)],
+                    octo_metrics::render(),
+                )
+                    .into_response()
+            }
+        }),
+    )
+}
+
+/// Compare without an early exit, so response timing doesn't reveal how much of a token matched.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Resolve on SIGTERM (what Kubernetes/ECS send on a rolling deploy) or SIGINT (Ctrl-C).
@@ -388,13 +521,6 @@ impl VerifyConfig {
     }
 }
 
-fn init_tracing() {
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info,octo=debug".to_string());
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .init();
-}
-
 /// Server configuration, read from environment variables.
 struct Config {
     database_url: String,
@@ -405,6 +531,7 @@ struct Config {
     rate_limit_backend: RateLimitBackend,
     network: StellarNetwork,
     horizon_url: String,
+    signing_policy: SigningPolicy,
     friendbot_url: Option<String>,
     /// Base URL of the hosted checkout frontend (e.g. `https://app.octo.dev`), used to build the
     /// `url` field on payment-link responses. Defaults to the local frontend dev server.
@@ -435,6 +562,8 @@ struct Config {
     /// `RUN_MIGRATIONS`, default true. Set false when the server connects as a runtime role that
     /// lacks DDL rights and migrations are applied separately by the migrator role.
     run_migrations: bool,
+    /// Prometheus `/metrics` listener; `None` (the default) when `METRICS_BIND_ADDR` is unset.
+    metrics: Option<MetricsConfig>,
     /// Resilience settings for all Horizon clients (API + ingest).
     ///
     /// | Variable | Default | Description |
@@ -454,6 +583,7 @@ impl fmt::Debug for Config {
             .field("database_url", &"[REDACTED]")
             .field("network", &self.network)
             .field("horizon_url", &self.horizon_url)
+            .field("signing_policy", &self.signing_policy)
             .field("friendbot_url", &self.friendbot_url)
             .field("public_app_url", &self.public_app_url)
             .field("public_api_url", &self.public_api_url)
@@ -466,12 +596,27 @@ impl fmt::Debug for Config {
             .field("ingest_interval_secs", &self.ingest_interval_secs)
             .field("ingest_page_limit", &self.ingest_page_limit)
             .field("shutdown_drain_timeout", &self.shutdown_drain_timeout)
+            .field("metrics", &self.metrics)
             .field("resilience", &self.resilience)
             .finish()
     }
 }
 
 impl Config {
+    fn parse_env_or<T>(name: &str, default: T) -> Result<T>
+    where
+        T: std::str::FromStr,
+        T::Err: fmt::Display,
+    {
+        match std::env::var(name) {
+            Ok(raw) => raw
+                .parse()
+                .with_context(|| format!("{name} must be a valid number (got {raw:?})")),
+            Err(std::env::VarError::NotPresent) => Ok(default),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Reject placeholder/low-entropy secrets and plaintext URLs when running on mainnet.
     fn ensure_safe_for_network(&self) -> Result<(), mainnet_guard::UnsafeMainnetConfig> {
         mainnet_guard::check(
@@ -506,6 +651,12 @@ impl Config {
 
         let horizon_url = std::env::var("HORIZON_URL")
             .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
+        let signing_policy = SigningPolicy::new(
+            Self::parse_env_or("STELLAR_TX_MAX_AGE_SECS", 300_u64)?,
+            Self::parse_env_or("STELLAR_FEE_PERCENTILE", 50_u8)?,
+            Self::parse_env_or("STELLAR_FEE_CEILING_STROOPS", 10_000_i64)?,
+        )
+        .map_err(anyhow::Error::msg)?;
         let friendbot_url = std::env::var("FRIENDBOT_URL").ok();
 
         let public_app_url = std::env::var("PUBLIC_APP_URL")
@@ -567,6 +718,7 @@ impl Config {
         };
 
         let resilience = ResilienceConfig::from_env();
+        let metrics = MetricsConfig::from_env()?;
 
         Ok(Config {
             database_url,
@@ -574,6 +726,7 @@ impl Config {
             rate_limit_backend,
             network,
             horizon_url,
+            signing_policy,
             friendbot_url,
             public_app_url,
             public_api_url,
@@ -589,8 +742,59 @@ impl Config {
             ingest_lock_retry,
             shutdown_drain_timeout,
             run_migrations,
+            metrics,
             resilience,
         })
+    }
+}
+
+/// `/metrics` listener settings. Off unless `METRICS_BIND_ADDR` is set.
+#[derive(Clone)]
+struct MetricsConfig {
+    bind_addr: std::net::SocketAddr,
+    /// `METRICS_TOKEN`: bearer token scrapers must present. Required on non-loopback binds.
+    token: Option<Zeroizing<String>>,
+}
+
+impl fmt::Debug for MetricsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetricsConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+impl MetricsConfig {
+    /// Minimum `METRICS_TOKEN` length, so a reachable endpoint isn't guarded by a guessable one.
+    const MIN_TOKEN_LEN: usize = 32;
+
+    fn from_env() -> Result<Option<MetricsConfig>> {
+        let raw = std::env::var("METRICS_BIND_ADDR").unwrap_or_default();
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        let bind_addr: std::net::SocketAddr = raw
+            .trim()
+            .parse()
+            .with_context(|| format!("METRICS_BIND_ADDR must be an ip:port (got {raw:?})"))?;
+        let token = std::env::var("METRICS_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .map(Zeroizing::new);
+        std::env::remove_var("METRICS_TOKEN");
+        if let Some(t) = &token {
+            if t.len() < Self::MIN_TOKEN_LEN {
+                anyhow::bail!("METRICS_TOKEN must be at least {} bytes", Self::MIN_TOKEN_LEN);
+            }
+        }
+        // Fail closed: anything beyond loopback must authenticate scrapers.
+        if !bind_addr.ip().is_loopback() && token.is_none() {
+            anyhow::bail!(
+                "METRICS_TOKEN is required when METRICS_BIND_ADDR is not a loopback address"
+            );
+        }
+        Ok(Some(MetricsConfig { bind_addr, token }))
     }
 }
 

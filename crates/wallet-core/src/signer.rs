@@ -35,6 +35,8 @@ use stellar_base::memo::Memo;
 #[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::operations::Operation;
 #[cfg(any(test, feature = "test-fixtures"))]
+use stellar_base::time_bounds::TimeBounds;
+#[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::transaction::Transaction;
 #[cfg(any(test, feature = "test-fixtures"))]
 use stellar_base::xdr::XDRSerialize;
@@ -220,7 +222,8 @@ pub fn sign_payment(
         .build()
         .map_err(|_| WalletError::Signing)?;
 
-    let mut builder = Transaction::builder(source, req.sequence, MIN_BASE_FEE);
+    let mut builder = Transaction::builder(source, req.sequence, MIN_BASE_FEE)
+        .with_time_bounds(configured_time_bounds());
     if let Some(id) = req.memo_id {
         builder = builder.with_memo(Memo::new_id(id));
     }
@@ -321,6 +324,7 @@ pub fn sign_change_trust(
         .map_err(|_| WalletError::Signing)?;
 
     let mut tx = Transaction::builder(source, req.sequence, MIN_BASE_FEE)
+        .with_time_bounds(configured_time_bounds())
         .add_operation(change_trust)
         .into_transaction()
         .map_err(|_| WalletError::Signing)?;
@@ -541,6 +545,18 @@ fn parse_destination(dest: &str) -> Result<stellar_base::crypto::MuxedAccount, W
     Ok(pk.into())
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
+fn configured_time_bounds() -> TimeBounds {
+    const DEFAULT_WINDOW_SECONDS: i64 = 300;
+    const MAX_WINDOW_SECONDS: i64 = 86_400;
+    let seconds = std::env::var("STELLAR_TX_MAX_AGE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|seconds| (1..=MAX_WINDOW_SECONDS).contains(seconds))
+        .unwrap_or(DEFAULT_WINDOW_SECONDS);
+    TimeBounds::valid_for(chrono::Duration::seconds(seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +633,12 @@ mod tests {
         match env {
             stellar_base::xdr::TransactionEnvelope::Tx(e) => {
                 assert_eq!(e.signatures.len(), 1, "must be signed once");
+                match &e.tx.cond {
+                    stellar_base::xdr::Preconditions::Time(bounds) => {
+                        assert!(bounds.max_time.0 > 0, "payment envelope must expire");
+                    }
+                    _ => panic!("payment envelope must have time bounds"),
+                }
             }
             _ => panic!("unexpected envelope variant"),
         }
@@ -638,6 +660,12 @@ mod tests {
         match env {
             stellar_base::xdr::TransactionEnvelope::Tx(e) => {
                 assert_eq!(e.signatures.len(), 1, "must be signed once");
+                match &e.tx.cond {
+                    stellar_base::xdr::Preconditions::Time(bounds) => {
+                        assert!(bounds.max_time.0 > 0, "trustline envelope must expire");
+                    }
+                    _ => panic!("trustline envelope must have time bounds"),
+                }
                 // A `None` limit must serialize as i64::MAX (unlimited), NOT 0 —
                 // 0 means "remove trustline" and yields op_invalid_limit on-chain.
                 match &e.tx.operations[0].body {
