@@ -108,6 +108,9 @@ build → sign → relay sequence. Accepting payments via a shareable link is wa
 [docs/api.md](docs/api.md#payment-link-checkout-flow); account activity categories are in
 [docs/audit-log.md](docs/audit-log.md).
 
+New here? Follow the end-to-end, curl-only walkthrough from signup to a received deposit
+(including webhook delivery) in **[docs/quickstart-testnet.md](docs/quickstart-testnet.md)**.
+
 ## Security architecture
 
 octo is non-custodial: user wallet keys are generated and held **client-side** (browser/SDK), so

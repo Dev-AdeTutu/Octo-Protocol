@@ -71,6 +71,14 @@ cargo test -p octo-store --test store_tests sponsorship_budget_reservation_under
 - **Tests:** crypto and derivation code must include test vectors (e.g. SEP-0005).
 - **Migrations:** `crates/store/migrations/` is forward-only and append-only. Every PR adding a migration must also update the decision index in `docs/migrations.md` in the same PR.
 
+## Architecture Decision Records
+
+Foundational design decisions live in [`docs/adr/`](docs/adr/) as Architecture Decision Records (ADRs). Each ADR captures the context, the decision, and its consequences.
+
+- Read the existing ADRs before proposing changes to core design areas (addresses, key handling, polling, etc.).
+- New foundational decisions must be recorded as an ADR in the same PR that introduces them, using the template at [`docs/adr/template.md`](docs/adr/template.md).
+- ADRs are immutable once accepted; supersede an old ADR with a new one rather than rewriting history.
+
 ## Branching
 
 Work on a feature branch; open a PR against `main`. CI must be green before merge.
