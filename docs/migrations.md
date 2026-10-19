@@ -64,8 +64,46 @@ This document serves as the single changelog-style decision index tracking every
 
 ---
 
+## Migration Lint Rules
+
+CI runs a migration linter (`ci/lint-migrations.sh`) on every PR that touches `crates/store/migrations/`. The linter scans each migration file for statements that can lock a hot table or destroy data, and fails the build unless the statement is either safe or explicitly annotated.
+
+### Flagged statements
+
+| Rule | Pattern | Why it is flagged |
+|---|---|---|
+| `drop-table` | `DROP TABLE ...` | Destroys all rows and dependent objects. |
+| `drop-column` | `ALTER TABLE ... DROP COLUMN ...` | Irreversibly discards data and breaks running code that still selects the column. |
+| `drop-constraint` | `ALTER TABLE ... DROP CONSTRAINT ...` | Silently removes integrity guarantees. |
+| `drop-index` | `DROP INDEX ...` | Can regress hot query paths; also takes an `ACCESS EXCLUSIVE` lock on the table. |
+| `create-index` | `CREATE INDEX ...` (without `CONCURRENTLY`) | Takes a write-blocking `SHARE` lock for the duration of the build. |
+| `alter-type` | `ALTER TABLE ... ALTER COLUMN ... TYPE ...` | Rewrites the whole table under `ACCESS EXCLUSIVE`; on large tables this is a full outage. |
+
+`CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` are allowed and are the preferred form for any table that may hold production traffic.
+
+### Annotated overrides
+
+When a flagged statement is genuinely required (e.g. a baseline migration that creates a brand-new table, or a deliberate data-destroying cleanup), annotate it with a comment on the line immediately above the statement:
+
+```sql
+-- migration-lint: allow <reason>
+CREATE INDEX idx_wallets_user ON wallets (user_id);
+```
+
+The reason is mandatory and must be non-empty; the linter rejects a bare `-- migration-lint: allow`. The annotation applies only to the next non-comment, non-blank line, so each exception must be documented individually. Reviewers should treat every override as a design decision worth questioning.
+
+### Existing exceptions
+
+| Migration | Statement | Reason |
+|---|---|---|
+| `0001_init.sql` | `CREATE INDEX` on newly created tables | Baseline schema; tables are empty at migration time, so a non-concurrent build cannot block traffic. |
+
+---
+
 ## Maintenance Convention
 
 > **Mandatory Rule for PRs:**
 > Any PR that adds a new migration file under `crates/store/migrations/` **must** append a new entry to the decision index table above within the same PR.
 > The entry must document the migration version, filename, target schema objects, foreign key `ON DELETE` rules, constraints, and the design rationale.
+>
+> Any PR that adds a `-- migration-lint: allow` override **must** also add a row to the *Existing exceptions* table above explaining why the flagged statement is safe.

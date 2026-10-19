@@ -150,6 +150,47 @@ jobs:
         # --redact keeps any match out of the public log output.
         run: gitleaks git --redact --no-banner --verbose
 
+  # Guards against careless migrations that lock a hot table or drop data. Only runs when a PR
+  # touches the migrations directory, so unrelated PRs pay nothing. The linter itself lives in
+  # scripts/lint-migrations.sh; destructive statements are allowed only with an explicit
+  # `-- migration-lint: allow <reason>` annotation in the SQL file.
+  migration-lint:
+    name: migration lint (destructive / locking statements)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Need the merge base to diff against, so fetch enough history for the base branch.
+          fetch-depth: 0
+      - name: Detect changed migrations
+        id: changed
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          base="origin/${{ github.base_ref }}"
+          files=$(git diff --name-only --diff-filter=ACMR "$base"...HEAD -- 'crates/store/migrations/**.sql' || true)
+          if [ -z "$files" ]; then
+            echo "No migration changes; skipping lint."
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changed migrations:"
+            echo "$files"
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "files<<EOF"
+              echo "$files"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+      - name: Lint migrations
+        if: steps.changed.outputs.any == 'true'
+        env:
+          CHANGED_MIGRATIONS: ${{ steps.changed.outputs.files }}
+        run: |
+          # Feed the changed files to the linter; it exits non-zero on any unannotated
+          # destructive or locking statement.
+          printf '%s\n' "$CHANGED_MIGRATIONS" | xargs -r scripts/lint-migrations.sh
+
   # A moving tag (e.g. @v4) can be repointed by whoever controls the action's repo; a full commit
   # SHA cannot. Dependabot keeps the pins and their version comments current.
   pinned-actions:
@@ -224,3 +265,94 @@ jobs:
           done
           npx -y @usebruno/cli run api-tests --env Local || true
           kill $SERVER_PID 2>/dev/null || true
+
+  # Tag-triggered release build. Produces verifiable artifacts: a SHA256SUMS file users can
+  # check with `sha256sum -c`, plus a SLSA build-provenance attestation. Release notes are
+  # extracted from CHANGELOG.md so the published release matches the repo's history.
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create the GitHub Release and upload assets
+      id-token: write       # OIDC token for the SLSA provenance generator
+      attestations: write   # write build-provenance attestations
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.84.1
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: false
+          shared-cache: true
+      - name: Build release binaries
+        # --locked: fail loudly on lockfile drift rather than silently regenerating it.
+        run: |
+          cargo build --release --locked \
+            -p octo-server \
+            -p octo-migrate-keys \
+            -p backfill-operation-index
+      - name: Stage artifacts and checksums
+        run: |
+          mkdir -p dist
+          for bin in octo-server octo-migrate-keys backfill-operation-index; do
+            cp "target/release/${bin}" "dist/${bin}"
+          done
+          ( cd dist && sha256sum octo-server octo-migrate-keys backfill-operation-index > SHA256SUMS )
+          cat dist/SHA256SUMS
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-binaries
+          path: dist/
+          if-no-files-found: error
+      - name: Generate SLSA build provenance
+        # Reusable workflow that emits a signed provenance attestation for the artifacts above.
+        uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
+        with:
+          base64-subjects: ${{ needs.build.outputs.hashes }}
+          upload-assets: false
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          # Pull the section for this version: from its heading up to the next version heading.
+          awk -v ver="$version" '
+            $0 ~ "^## \\[?" ver "\\]?" { capture=1; next }
+            capture && /^## / { exit }
+            capture { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "No CHANGELOG section found for ${version}; falling back to tag name." >&2
+            echo "Release ${tag}" > release-notes.md
+          fi
+          {
+            echo "body<<EOF"
+            cat release-notes.md
+            echo ""
+            echo "## Verifying artifacts"
+            echo ""
+            echo '```'
+            echo "sha256sum -c SHA256SUMS"
+            echo '```'
+            echo ""
+            echo "Build provenance is attached as a SLSA attestation; verify with"
+            echo "\`gh attestation verify <artifact> --repo \${{ github.repository }}\`."
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191 # v2.0.8
+        with:
+          body: ${{ steps.notes.outputs.body }}
+          files: |
+            dist/octo-server
+            dist/octo-migrate-keys
+            dist/backfill-operation-index
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
