@@ -103,6 +103,44 @@ responsible for the largest share of real-world crypto theft.
 | Two ingest replicas burning Horizon quota / racing cursors | Postgres advisory lock elects one ingest leader per network; the leader re-verifies the lock before each tick (`docs/ha-topology.md`) | 7 |
 | Information leak in errors | Typed errors; no internal detail or secret in API responses | 5, 6 |
 
+### E.1 Trusted proxies and client IP derivation
+Rate-limit buckets are keyed on the client IP, so *how* that IP is derived is itself a security
+control. `client_ip()` in `crates/api/src/rate_limit.rs` only honors `X-Forwarded-For` when the
+socket peer address matches `TRUSTED_PROXY_CIDRS`; it then walks the header **right-to-left**,
+skipping hops that are themselves trusted proxies, and falls back to the socket peer IP
+otherwise. A spoofed header from an untrusted source is therefore ignored.
+
+- **Assumption:** the deployment terminates TLS at a proxy whose CIDRs are listed in
+  `TRUSTED_PROXY_CIDRS`, and no untrusted hop can reach the API directly (the API is not
+  exposed without passing through the proxy).
+- **Owner:** deployment operator.
+- **Check:** configuration review of `TRUSTED_PROXY_CIDRS` against the actual ingress CIDRs,
+  plus a runtime probe that sends a spoofed `X-Forwarded-For` from an untrusted source and
+  confirms the resulting bucket key is the peer IP, not the header value.
+
+### E.2 Rate limiter scope and replica multiplication
+`RATE_LIMIT_BACKEND` defaults to `postgres` in `bin/server/src/main.rs`, giving counters shared
+across replicas that survive restarts. In `memory` mode the effective limit is multiplied by the
+replica count and resets on every restart. If the shared backend errors, `RateLimiter::check`
+degrades to the per-process fallback rather than failing open entirely.
+
+- **Assumption:** production sets `RATE_LIMIT_BACKEND=postgres` and the `rate_limit_buckets`
+  table is reachable from every replica.
+- **Owner:** API team.
+- **Check:** a startup log line naming the selected backend, plus an integration test that
+  exceeds a limit across two replicas and confirms the shared counter enforces it.
+
+### E.3 CORS policy and allowed origins
+`build_router` in `crates/api/src/lib.rs` parses `ALLOWED_ORIGINS` (comma-separated) and
+defaults to an **empty allow-list** — no cross-origin browser access — permitting only the
+listed methods and headers.
+
+- **Assumption:** `ALLOWED_ORIGINS` is set to the exact production frontend origins and is
+  never `*`.
+- **Owner:** deployment operator.
+- **Check:** configuration review of `ALLOWED_ORIGINS`, plus a preflight request from an
+  unlisted origin that must be rejected.
+
 ### F. Operational / process
 | Threat | Defense | Step |
 |---|---|---|
