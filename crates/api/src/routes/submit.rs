@@ -339,7 +339,7 @@ pub async fn withdraw_confirm(
     {
         // Wrong/expired/reused code: never touches Horizon. Tell the user in case it wasn't them.
         if let Some(p) = &payment {
-            let html = octo_email::templates::withdrawal_failed_email(
+            let body = octo_email::templates::withdrawal_failed_email(
                 &format_amount(p.amount_stroops),
                 &p.asset_code,
                 &p.destination,
@@ -347,7 +347,7 @@ pub async fn withdraw_confirm(
             );
             let _ = state
                 .email()
-                .send(&user.email, "Withdrawal attempt failed", &html)
+                .send(&user.email, "Withdrawal attempt failed", &body)
                 .await;
         }
         return Err(ApiError::BadRequest("invalid or expired code".into()));
@@ -371,7 +371,7 @@ pub async fn withdraw_confirm(
         outcome.destination.clone(),
     );
     if let (Some(amount), Some(asset), Some(destination)) = (amount, asset, destination) {
-        let html = if outcome.response.status == "confirmed" {
+        let body = if outcome.response.status == "confirmed" {
             octo_email::templates::withdrawal_success_email(
                 &amount,
                 &asset,
@@ -395,7 +395,7 @@ pub async fn withdraw_confirm(
         } else {
             "Withdrawal attempt failed"
         };
-        let _ = state.email().send(&user.email, subject, &html).await;
+        let _ = state.email().send(&user.email, subject, &body).await;
     }
 
     let (code, json) = Envelope::created(outcome.response);

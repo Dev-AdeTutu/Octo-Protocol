@@ -334,10 +334,10 @@ pub async fn verify_email(
         .await
         .map_err(|_| ApiError::Internal)?;
 
-    let welcome_html = octo_email::templates::welcome_email(&user.email);
+    let welcome = octo_email::templates::welcome_email(&user.email);
     let _ = state
         .email()
-        .send(&user.email, "Welcome to Octo", &welcome_html)
+        .send(&user.email, "Welcome to Octo", &welcome)
         .await;
 
     let token = start_session(&state, user.id, user.session_epoch, &headers).await?;

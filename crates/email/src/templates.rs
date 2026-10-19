@@ -13,6 +13,13 @@
 //! detail) — MUST go through [`html_escape`] before it is interpolated into HTML. Only values
 //! the server generates itself (the numeric OTP, the formatted amount, fixed copy) skip it.
 
+/// A rendered message: the styled HTML part and its plain-text alternative.
+#[derive(Debug, Clone)]
+pub struct Body {
+    pub html: String,
+    pub text: String,
+}
+
 const BURGUNDY: &str = "#7b1733";
 const BURGUNDY_BRIGHT: &str = "#b81f4d";
 const INK: &str = "#0a0506";
@@ -77,6 +84,19 @@ pub fn html_escape(s: &str) -> String {
     out
 }
 
+/// Make an untrusted value safe for the plain-text part: control characters (CR/LF included)
+/// become spaces so a value can't forge extra lines. No HTML escaping — text/plain isn't markup.
+fn text_clean(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+fn text_shell(lines: &[String]) -> String {
+    format!(
+        "Octo\n\n{}\n\n--\nOcto · Stellar-native wallet infrastructure\n",
+        lines.join("\n")
+    )
+}
+
 fn shell(body: &str, icon: Icon) -> String {
     let icon_url = format!("{ICON_BASE}/{}", icon_url(icon));
     let socials = socials();
@@ -103,14 +123,14 @@ fn shell(body: &str, icon: Icon) -> String {
 }
 
 /// One-time code email, shared by signup verification and withdrawal confirmation.
-pub fn otp_email(code: &str, purpose: &str) -> String {
+pub fn otp_email(code: &str, purpose: &str) -> Body {
     let action = match purpose {
         "withdrawal" => "confirm a withdrawal",
         "password_reset" => "reset your password",
         "email_change" => "confirm your new email address",
         _ => "verify your email",
     };
-    shell(
+    let html = shell(
         &format!(
             "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Your verification code</p>\
 <p style=\"margin:0 0 20px;color:#666;\">Use this code to {action}.</p>\
@@ -120,7 +140,14 @@ pub fn otp_email(code: &str, purpose: &str) -> String {
 <p style=\"margin:20px 0 0;color:#999;font-size:12px;\">This code expires in 10 minutes. If you didn't request it, you can ignore this email.</p>"
         ),
         Icon::Key,
-    )
+    );
+    let text = text_shell(&[
+        format!("Your verification code: {code}"),
+        format!("Use this code to {action}."),
+        "This code expires in 10 minutes. If you didn't request it, you can ignore this email."
+            .to_string(),
+    ]);
+    Body { html, text }
 }
 
 /// The OTP inside an [`otp_email`] body, for test transports that capture rendered messages.
@@ -142,29 +169,42 @@ fn escape_html(input: &str) -> String {
 }
 
 /// Sent to the OLD address after an email change, so a hijacked change is noticed.
-pub fn email_changed_email(new_email: &str) -> String {
+pub fn email_changed_email(new_email: &str) -> Body {
+    let raw = text_clean(new_email);
     let new_email = escape_html(new_email);
-    shell(
+    let html = shell(
         &format!(
             "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Your login email was changed</p>\
 <p style=\"margin:0;color:#666;\">This account's email is now {new_email}. If this wasn't you, reset your password right away.</p>"
         ),
         Icon::Warn,
-    )
+    );
+    let text = text_shell(&[
+        "Your login email was changed".to_string(),
+        format!("This account's email is now {raw}. If this wasn't you, reset your password right away."),
+    ]);
+    Body { html, text }
 }
 
 /// Sent once, right after signup verification succeeds.
-pub fn welcome_email(email: &str) -> String {
+pub fn welcome_email(email: &str) -> Body {
+    let raw = text_clean(email);
     // The address is user-supplied at signup; RFC 5322 local parts may legally contain `<"'&`.
     let email = html_escape(email);
-    shell(
+    let html = shell(
         &format!(
             "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Welcome to Octo 🎉</p>\
 <p style=\"margin:0 0 20px;color:#666;\">{email} is verified and ready to go.</p>\
 <a href=\"https://octohq.org/dashboard\" style=\"display:inline-block;background:{BURGUNDY_BRIGHT};border-radius:10px;padding:12px 28px;color:#fff;font-weight:600;text-decoration:none;font-size:14px;\">Go to dashboard</a>"
         ),
         Icon::Wave,
-    )
+    );
+    let text = text_shell(&[
+        "Welcome to Octo".to_string(),
+        format!("{raw} is verified and ready to go."),
+        "Go to dashboard: https://octohq.org/dashboard".to_string(),
+    ]);
+    Body { html, text }
 }
 
 /// Sent after a withdrawal successfully relays to Horizon.
@@ -173,14 +213,19 @@ pub fn withdrawal_success_email(
     asset: &str,
     destination: &str,
     tx_hash: &str,
-) -> String {
+) -> Body {
+    let (raw_asset, raw_destination, raw_hash) = (
+        text_clean(asset),
+        text_clean(destination),
+        text_clean(tx_hash),
+    );
     // Asset and destination come from the user-signed XDR, the hash from Horizon's response.
     let (asset, destination, tx_hash) = (
         html_escape(asset),
         html_escape(destination),
         html_escape(tx_hash),
     );
-    shell(
+    let html = shell(
         &format!(
             "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Withdrawal confirmed</p>\
 <p style=\"margin:0 0 20px;color:#666;\">Your withdrawal has been confirmed on-chain.</p>\
@@ -191,7 +236,15 @@ pub fn withdrawal_success_email(
 </div>"
         ),
         Icon::Check,
-    )
+    );
+    let text = text_shell(&[
+        "Withdrawal confirmed".to_string(),
+        "Your withdrawal has been confirmed on-chain.".to_string(),
+        format!("Amount: {amount} {raw_asset}"),
+        format!("Destination: {raw_destination}"),
+        format!("Transaction: {raw_hash}"),
+    ]);
+    Body { html, text }
 }
 
 /// Sent when a withdrawal was attempted but did not complete (wrong OTP, or Horizon rejected it).
@@ -200,14 +253,19 @@ pub fn withdrawal_failed_email(
     asset: &str,
     destination: &str,
     reason: &str,
-) -> String {
+) -> Body {
+    let (raw_asset, raw_destination, raw_reason) = (
+        text_clean(asset),
+        text_clean(destination),
+        text_clean(reason),
+    );
     // Asset and destination come from the user-signed XDR, the reason may echo Horizon's detail.
     let (asset, destination, reason) = (
         html_escape(asset),
         html_escape(destination),
         html_escape(reason),
     );
-    shell(
+    let html = shell(
         &format!(
             "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Withdrawal attempt failed</p>\
 <p style=\"margin:0 0 20px;color:#666;\">A withdrawal attempt on your account did not complete.</p>\
@@ -219,7 +277,16 @@ pub fn withdrawal_failed_email(
 <p style=\"margin:20px 0 0;color:#999;font-size:12px;\">If this wasn't you, secure your account and contact support.</p>"
         ),
         Icon::Warn,
-    )
+    );
+    let text = text_shell(&[
+        "Withdrawal attempt failed".to_string(),
+        "A withdrawal attempt on your account did not complete.".to_string(),
+        format!("Amount: {amount} {raw_asset}"),
+        format!("Destination: {raw_destination}"),
+        format!("Reason: {raw_reason}"),
+        "If this wasn't you, secure your account and contact support.".to_string(),
+    ]);
+    Body { html, text }
 }
 
 #[cfg(test)]
@@ -228,7 +295,47 @@ mod tests {
 
     #[test]
     fn extract_otp_round_trips_the_rendered_otp_email() {
-        assert_eq!(extract_otp(&otp_email("042817", "signup")).as_deref(), Some("042817"));
-        assert_eq!(extract_otp(&welcome_email("a@b.test")), None);
+        assert_eq!(extract_otp(&otp_email("042817", "signup").html).as_deref(), Some("042817"));
+        assert_eq!(extract_otp(&welcome_email("a@b.test").html), None);
+    }
+
+    const HOSTILE: &str = "<b>\"x\"&'</b>\r\nInjected: yes";
+
+    #[test]
+    fn every_template_has_a_text_part_without_markup() {
+        let bodies = [
+            otp_email("123456", "signup"),
+            email_changed_email("a@b.test"),
+            welcome_email("a@b.test"),
+            withdrawal_success_email("1.0", "USDC", "GDEST", "abc"),
+            withdrawal_failed_email("1.0", "USDC", "GDEST", "nope"),
+        ];
+        for b in bodies {
+            assert!(!b.html.is_empty());
+            assert!(b.text.contains("Octo") && !b.text.contains("<div"));
+        }
+    }
+
+    #[test]
+    fn html_part_escapes_untrusted_values_and_text_part_strips_line_breaks() {
+        let welcome = welcome_email(HOSTILE);
+        assert!(!welcome.html.contains("<b>"));
+        assert!(!welcome.text.contains('\r') && !welcome.text.contains("\nInjected"));
+        let changed = email_changed_email(HOSTILE);
+        assert!(!changed.html.contains("<b>"));
+        assert!(!changed.text.contains("\nInjected"));
+        let ok = withdrawal_success_email("1.0", HOSTILE, HOSTILE, HOSTILE);
+        assert!(!ok.html.contains("<b>"));
+        assert!(!ok.text.contains("\nInjected"));
+        let failed = withdrawal_failed_email("1.0", HOSTILE, HOSTILE, HOSTILE);
+        assert!(!failed.html.contains("<b>"));
+        assert!(!failed.text.contains("\nInjected"));
+    }
+
+    #[test]
+    fn text_part_keeps_values_unescaped() {
+        let b = welcome_email("o'brien&co@b.test");
+        assert!(b.text.contains("o'brien&co@b.test"));
+        assert!(b.html.contains("o&#x27;brien&amp;co@b.test"));
     }
 }

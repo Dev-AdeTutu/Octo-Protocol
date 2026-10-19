@@ -18,6 +18,8 @@ pub struct Email {
     pub to: String,
     pub subject: String,
     pub html: String,
+    /// Plain-text alternative sent as the second multipart part.
+    pub text: String,
 }
 
 // Manual Debug: the body can carry an OTP, so only routing metadata is ever formatted.
@@ -77,6 +79,7 @@ impl ResendTransport {
             "to": email.to,
             "subject": email.subject,
             "html": email.html,
+            "text": email.text,
         });
 
         let resp = self
@@ -189,7 +192,7 @@ mod tests {
     }
 
     fn msg() -> Email {
-        Email { to: "u@x.test".into(), subject: "s".into(), html: "<p>h</p>".into() }
+        Email { to: "u@x.test".into(), subject: "s".into(), html: "<p>h</p>".into(), text: "h".into() }
     }
 
     fn fast_sender(endpoint: String) -> ResendTransport {

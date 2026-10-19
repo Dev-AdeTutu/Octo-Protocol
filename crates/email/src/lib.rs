@@ -60,17 +60,23 @@ impl EmailSender {
 
     /// Send an OTP email.
     pub async fn send_otp(&self, to: &str, purpose: &str, code: &str) -> Result<(), EmailError> {
-        let html = templates::otp_email(code, purpose);
-        self.send(to, "Your Octo verification code", &html).await
+        let body = templates::otp_email(code, purpose);
+        self.send(to, "Your Octo verification code", &body).await
     }
 
-    /// Send one HTML email. Propagates failure — callers on a critical path (e.g. an OTP the
-    /// user has no other way to receive) need to know sending failed, not just log it.
-    pub async fn send(&self, to: &str, subject: &str, html: &str) -> Result<(), EmailError> {
+    /// Send one multipart (HTML + plain-text) email. Propagates failure — callers on a critical
+    /// path (e.g. an OTP the user has no other way to receive) need to know sending failed.
+    pub async fn send(
+        &self,
+        to: &str,
+        subject: &str,
+        body: &templates::Body,
+    ) -> Result<(), EmailError> {
         let email = Email {
             to: to.to_string(),
             subject: subject.to_string(),
-            html: html.to_string(),
+            html: body.html.clone(),
+            text: body.text.clone(),
         };
         self.transport.deliver(&email).await
     }
