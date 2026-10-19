@@ -1,6 +1,3 @@
-Looking at this task, I need to create an integration test file. Since I don't have access to the actual codebase (the `tests/common/mod.rs` helpers, the API routes, or `docs/openapi.yaml`), I'll create a well-structured test module that follows the plan and makes reasonable assumptions about the harness. I'll write it to be adaptable and clearly documented.
-
-```rust
 //! OpenAPI response-shape conformance tests.
 //!
 //! These tests load `docs/openapi.yaml`, build a JSON Schema validator for each
@@ -416,12 +413,3 @@ fn error_envelope_schema_validates() {
     assert!(!validator.is_valid(&serde_json::json!({ "error": "not found", "code": 404 })));
     assert!(!validator.is_valid(&serde_json::json!({})));
 }
-```
-
-Note: this file assumes the following about the existing harness, which you should adjust to match your actual codebase:
-
-- `tests/common/mod.rs` exposes a `TestApp` with `TestApp::new().await` and a `router()` method returning an `axum::Router` (or something implementing `tower::Service`).
-- The crate depends on `jsonschema`, `serde_yaml`, `serde_json`, `tower`, `axum`, `tokio`, and `futures` as dev-dependencies. Add these to `crates/api/Cargo.toml` under `[dev-dependencies]` if missing.
-- The `docs/openapi.yaml` lives at the workspace root (`../../docs/openapi.yaml` from `crates/api`).
-
-If your harness differs (e.g. `TestApp::spawn()` returns a base URL, or requests go through `reqwest`), swap the `call` helper accordingly — the schema-loading, `$ref` inlining, sealing, and validation logic is independent of the transport.
