@@ -212,8 +212,12 @@ so it cannot escalate or revoke itself.
   sits *inside* the response envelope, so the full shape is
   `{ statusCode, message, data: { data: [...], next_cursor } }`.
 - **Amounts** are integer **stroops** (1 XLM = 10,000,000) end-to-end — never floats.
-- **Errors** map to `400` (validation), `401`, `403`, `404`, `409` (conflict), `410` (removed
-  custodial endpoints), `413` (body over 64 KiB), `429` (budget exceeded). There is no `422`.
+- **Errors** use the same envelope with `data: null` and a human-readable `message`; every
+  error code is catalogued with its HTTP status, meaning and remedy in
+  **[errors.md](errors.md)**. In brief: `400` (validation), `401` (missing/invalid credential),
+  `403` (not allowed for this credential or resource), `404` (not found), `409` (conflict),
+  `410` (removed custodial endpoints), `413` (body over 64 KiB), `429` (rate limit or budget
+  exceeded), `500` (internal error), `504` (upstream timeout). There is no `422`.
 
 ## Rate Limits
 
