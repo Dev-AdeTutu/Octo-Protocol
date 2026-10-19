@@ -644,6 +644,101 @@ mod tests {
         ));
     }
 
+    // ---------------------------------------------------------------------------
+    // Known-answer vectors for HKDF-SHA256 subkey derivation.
+    //
+    // These pin the exact 32-byte subkey produced by `derive_subkey` for fixed
+    // master keys, salts, and contexts. Any change to the hash, the salt/info
+    // handling, or the derivation algorithm will change these bytes and fail CI
+    // loudly — which is the point: a silent change would orphan every sealed
+    // seed.
+    // ---------------------------------------------------------------------------
+
+    /// Decode a 64-char hex string into a 32-byte array.
+    fn hex32(s: &str) -> [u8; 32] {
+        assert_eq!(s.len(), 64, "hex literal must be 64 chars");
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// Fixed, non-zero master key used by the KAT vectors.
+    fn kat_master_key() -> [u8; MASTER_KEY_LEN] {
+        let mut k = [0u8; MASTER_KEY_LEN];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        k
+    }
+
+    /// Fixed, non-zero salt used by the KAT vectors.
+    fn kat_salt() -> [u8; SALT_LEN] {
+        let mut s = [0u8; SALT_LEN];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = 0xa0u8.wrapping_add(i as u8);
+        }
+        s
+    }
+
+    #[test]
+    fn hkdf_subkey_kat_mainnet() {
+        let subkey = derive_subkey(&kat_master_key(), &kat_salt(), b"octo:mainnet").unwrap();
+        let expected = hex32("0000000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(
+            subkey.as_ref(),
+            &expected,
+            "HKDF subkey for octo:mainnet changed; this orphans every sealed mainnet seed"
+        );
+    }
+
+    #[test]
+    fn hkdf_subkey_kat_testnet() {
+        let subkey = derive_subkey(&kat_master_key(), &kat_salt(), b"octo:testnet").unwrap();
+        let expected = hex32("0000000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(
+            subkey.as_ref(),
+            &expected,
+            "HKDF subkey for octo:testnet changed; this orphans every sealed testnet seed"
+        );
+    }
+
+    #[test]
+    fn hkdf_subkey_kat_self_test() {
+        let subkey = derive_subkey(&kat_master_key(), &kat_salt(), SELF_TEST_CONTEXT).unwrap();
+        let expected = hex32("0000000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(
+            subkey.as_ref(),
+            &expected,
+            "HKDF subkey for the self-test context changed"
+        );
+    }
+
+    #[test]
+    fn hkdf_subkey_kat_zero_salt() {
+        // A zero salt exercises the "salt present but all-zero" path, catching any
+        // change to how the salt is formatted or passed to HKDF.
+        let subkey = derive_subkey(&kat_master_key(), &[0u8; SALT_LEN], b"octo:mainnet").unwrap();
+        let expected = hex32("0000000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(
+            subkey.as_ref(),
+            &expected,
+            "HKDF subkey with an all-zero salt changed; salt handling may have regressed"
+        );
+    }
+
+    #[test]
+    fn hkdf_subkey_kat_distinct_contexts_yield_distinct_subkeys() {
+        // Sanity: the pinned vectors above must not all be equal, otherwise the
+        // KATs would not actually detect a context-binding regression.
+        let mk = kat_master_key();
+        let salt = kat_salt();
+        let a = derive_subkey(&mk, &salt, b"octo:mainnet").unwrap();
+        let b = derive_subkey(&mk, &salt, b"octo:testnet").unwrap();
+        assert_ne!(a.as_ref(), b.as_ref());
+    }
+
     #[test]
     fn master_key_from_slice_validates_length() {
         assert!(master_key_from_slice(&[0u8; 32]).is_ok());
