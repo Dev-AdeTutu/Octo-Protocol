@@ -59,6 +59,10 @@ decrypt. Consequently:
   **Never returns a mnemonic** — the client generated it and the server never saw it.
 - `GET  /v1/wallets` — list your wallets (paginated).
 - `GET  /v1/wallets/{id}` — wallet details.
+- `PATCH /v1/wallets/{id}` — rename or annotate a wallet. Body: `{ "label"?: string|null,
+  "description"?: string|null }` — omit a field to keep it, `null` or `""` to clear it. `label` ≤ 64
+  characters, `description` ≤ 500; control and invisible formatting characters are `400`. Owner
+  login or a `write`-scoped API key; archived wallets are `403`. Audit-logged.
 - `GET  /v1/wallets/{id}/balances` — live on-chain balances.
 - `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated).
 - `GET  /v1/wallets/{id}/backup` — the opaque client-encrypted backup blob, for new-device

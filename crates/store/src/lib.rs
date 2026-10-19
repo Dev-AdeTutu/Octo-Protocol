@@ -752,6 +752,41 @@ impl Store {
         Ok(())
     }
 
+    /// Update a wallet's label and/or description. `None` leaves a field unchanged; `Some(None)`
+    /// clears it. Archived wallets are refused inside the same statement, so archival can't race it.
+    pub async fn update_wallet_details(
+        &self,
+        id: Uuid,
+        label: Option<Option<&str>>,
+        description: Option<Option<&str>>,
+    ) -> Result<Wallet, StoreError> {
+        let updated = sqlx::query_as::<_, Wallet>(
+            r#"
+            UPDATE wallets SET
+                label = CASE WHEN $2 THEN $3 ELSE label END,
+                description = CASE WHEN $4 THEN $5 ELSE description END,
+                updated_at = now()
+            WHERE id = $1 AND archived_at IS NULL
+            RETURNING *
+            "#,
+        )
+        .bind(id)
+        .bind(label.is_some())
+        .bind(label.flatten())
+        .bind(description.is_some())
+        .bind(description.flatten())
+        .fetch_optional(&self.pool)
+        .await?;
+        match updated {
+            Some(w) => Ok(w),
+            // No row updated: tell "missing" apart from "archived".
+            None => match self.get_wallet(id).await?.archived_at {
+                Some(_) => Err(StoreError::WalletArchived),
+                None => Err(StoreError::NotFound),
+            },
+        }
+    }
+
     /// Fetch a wallet by id.
     pub async fn get_wallet(&self, id: Uuid) -> Result<Wallet, StoreError> {
         sqlx::query_as::<_, Wallet>("SELECT * FROM wallets WHERE id = $1")
