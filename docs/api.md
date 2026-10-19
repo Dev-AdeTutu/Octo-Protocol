@@ -171,6 +171,23 @@ carries fee float only — the one server-held key in the system, bounded by you
 Deliveries are signed `HMAC-SHA256` over the raw body. Endpoint URLs are SSRF-screened:
 loopback, private and link-local targets are rejected, IPv4 and bracketed IPv6 alike.
 
+### Verifying webhook signatures
+
+Every delivery carries an `X-Octo-Signature` header. Its value is the lowercase hex
+`HMAC-SHA256` of the **raw request body bytes**, keyed with the endpoint's secret (the one
+returned when the endpoint was registered). Compute the digest over the bytes exactly as
+received — do not parse and re-serialize the JSON first, since any whitespace or key-order
+change breaks the match.
+
+Compare the computed digest with the header using a **constant-time** comparison (e.g.
+`crypto.timingSafeEqual` in Node, `hmac.compare_digest` in Python, `hmac.Equal` in Go,
+`subtle::ConstantTimeEq` in Rust). A plain `==` leaks timing information and must not be used.
+Reject the delivery with a non-2xx status when the signature is missing or does not match.
+
+For complete, runnable samples in Node, Python, Go and Rust — plus guidance on retries,
+out-of-order delivery and idempotent handling — see
+**[webhook-consumer-guide.md](webhook-consumer-guide.md)**.
+
 A delivery whose retries are exhausted ends in the terminal `dead` status. Set
 `OCTO_WEBHOOK_AUTO_DISABLE_AFTER=N` to deactivate an endpoint after `N` consecutive dead
 deliveries (its `auto_disabled_at` is then set); unset means never.

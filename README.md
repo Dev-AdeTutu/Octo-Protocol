@@ -68,6 +68,16 @@ just test
 just run            # cargo run -p octo-server  → API on $BIND_ADDR (default :8080)
 ```
 
+### Configuration
+
+Every setting is read from the environment (or `.env`). The complete reference — purpose,
+default, whether it is required, and whether it is a **secret** — lives in
+[docs/environment-variables.md](docs/environment-variables.md). Read it before copying
+`.env.example`, and never commit a filled-in `.env`.
+
+CI enforces this: a test fails if the server reads an environment variable that is not
+documented in that reference, so the table always matches the code.
+
 Then, against a running server (testnet):
 
 All routes below require a dashboard login token (`Authorization: Bearer <JWT>` from
