@@ -17,6 +17,7 @@ pub mod sponsor_validation;
 mod state;
 pub mod submit_validation;
 pub mod validation;
+pub mod withdrawal_reconciler;
 
 pub use error::{ApiError, ApiResult, Envelope};
 pub use signing_policy::SigningPolicy;

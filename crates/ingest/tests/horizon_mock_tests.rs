@@ -43,7 +43,7 @@ async fn payments_after_forwards_cursor_between_pages() {
     // Page one: no cursor query param present. Two records; the last one's paging_token must be
     // forwarded as the cursor for page two.
     Mock::given(method("GET"))
-        .and(path(format!("/accounts/{ACCOUNT}/payments")))
+        .and(path(format!("/accounts/{ACCOUNT}/operations")))
         .and(query_param_is_missing("cursor"))
         .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![
             record_json("111", "111-0"),
@@ -54,7 +54,7 @@ async fn payments_after_forwards_cursor_between_pages() {
 
     // Page two: only served when the request carries cursor=222-0 (page one's last paging_token).
     Mock::given(method("GET"))
-        .and(path(format!("/accounts/{ACCOUNT}/payments")))
+        .and(path(format!("/accounts/{ACCOUNT}/operations")))
         .and(query_param("cursor", "222-0"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(page(vec![record_json("333", "333-0")])),
@@ -88,7 +88,7 @@ async fn payments_after_includes_order_and_join_params() {
     // present. Any request that doesn't match falls through to wiremock's default 404, which
     // payments_after treats as an empty vec — so a non-empty result here proves the exact params.
     Mock::given(method("GET"))
-        .and(path(format!("/accounts/{ACCOUNT}/payments")))
+        .and(path(format!("/accounts/{ACCOUNT}/operations")))
         .and(query_param("order", "asc"))
         .and(query_param("join", "transactions"))
         .and(query_param("limit", "7"))
@@ -188,7 +188,7 @@ async fn payments_after_returns_empty_vec_on_404() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
-        .and(path(format!("/accounts/{ACCOUNT}/payments")))
+        .and(path(format!("/accounts/{ACCOUNT}/operations")))
         .respond_with(ResponseTemplate::new(404))
         .mount(&server)
         .await;
@@ -203,4 +203,59 @@ async fn payments_after_returns_empty_vec_on_404() {
         records.is_empty(),
         "a 404 (unfunded/nonexistent account) must yield an empty vec, not an error"
     );
+}
+
+const BALANCE_ID: &str = "00000000929b20b72e5890ab51c24f1cc46fa01c4f318d8d33367d24dd614cfdf5491072";
+
+#[tokio::test]
+async fn claim_credit_reads_the_account_credited_effect_for_our_account() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/operations/12884905985/effects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![
+            json!({ "type": "claimable_balance_claimed", "balance_id": BALANCE_ID,
+                    "asset": "native", "amount": "3.0000000" }),
+            // A credit to someone else in the same operation must never be picked up.
+            json!({ "type": "account_credited", "account": "GSOMEONEELSE",
+                    "asset_type": "native", "amount": "99.0000000" }),
+            json!({ "type": "account_credited", "account": ACCOUNT,
+                    "asset_type": "native", "amount": "3.0000000" }),
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let credit = HorizonPayments::new(server.uri())
+        .claim_credit("12884905985", ACCOUNT)
+        .await
+        .expect("effects")
+        .expect("credit to our account");
+    assert_eq!(credit.amount, "3.0000000");
+    assert_eq!(credit.asset_type.as_deref(), Some("native"));
+}
+
+#[tokio::test]
+async fn claimable_balance_origin_returns_the_creating_operation() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/claimable_balances/{BALANCE_ID}/operations")))
+        .and(query_param("order", "asc"))
+        .and(query_param("limit", "1"))
+        .and(query_param("join", "transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![json!({
+            "type": "create_claimable_balance",
+            "source_account": "GCREATOR",
+            "transaction": { "memo_type": "id", "memo": "7", "ledger": 3 },
+        })])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let origin = HorizonPayments::new(server.uri())
+        .claimable_balance_origin(BALANCE_ID)
+        .await
+        .expect("origin")
+        .expect("create op");
+    assert_eq!(origin.source_account.as_deref(), Some("GCREATOR"));
+    assert_eq!(origin.transaction.and_then(|t| t.memo).as_deref(), Some("7"));
 }

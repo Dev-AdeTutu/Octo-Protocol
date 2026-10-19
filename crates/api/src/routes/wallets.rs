@@ -982,6 +982,7 @@ mod tests {
             archived_at: None,
             ingest_paused: false,
             ingest_paused_at: None,
+            ingest_streaming: false,
         };
         let responses = [
             serde_json::to_string(&CreateWalletResponse {

@@ -53,6 +53,8 @@ fn make_record(id: &str) -> PaymentRecord {
         asset_issuer: None,
         amount: Some("1.0000000".into()),
         starting_balance: None,
+        balance_id: None,
+        claimant: None,
         transaction: Some(TransactionRecord {
             memo_type: None,
             memo: None,
@@ -87,7 +89,7 @@ struct PaymentsQuery {
     cursor: Option<String>,
 }
 
-/// Axum handler for `/accounts/:account/payments?...`
+/// Axum handler for `/accounts/:account/operations?...`
 async fn mock_payments_handler(
     Query(q): Query<PaymentsQuery>,
     State(state): State<MockState>,
@@ -135,7 +137,7 @@ async fn mock_payments_handler(
 async fn start_mock_horizon(state: MockState) -> (String, Arc<Mutex<usize>>) {
     let call_count = state.call_count.clone();
     let app = Router::new()
-        .route("/accounts/:account/payments", get(mock_payments_handler))
+        .route("/accounts/:account/operations", get(mock_payments_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
