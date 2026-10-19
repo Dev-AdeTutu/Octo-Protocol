@@ -16,9 +16,6 @@ use octo_wallet_core::{validate_change_trust, WalletError};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Stellar's minimum base fee per operation, in stroops (matches `signing_info`).
-const BASE_FEE_STROOPS: i64 = 100;
-
 #[derive(Debug, Default, Deserialize)]
 pub struct TrustlineRequest {
     /// Asset code to trust (1–12 bytes, e.g. `"USDC"`).
@@ -37,7 +34,10 @@ pub struct TrustlineSigningInfo {
     #[serde(with = "crate::json::i64_as_string")]
     pub sequence: i64,
     pub network_passphrase: String,
+    /// Selected per-operation fee returned by the shared signing-info fee policy.
     pub base_fee_stroops: i64,
+    /// Absolute UNIX timestamp in seconds to use as the transaction time-bound `max_time`.
+    pub max_time: u64,
     pub asset_code: String,
     pub asset_issuer: String,
     /// Limit to put on the operation, as a string (`i64::MAX` = unlimited exceeds JS safe ints).
@@ -95,11 +95,14 @@ pub async fn add_trustline(
             other => other,
         })?;
 
+    let signing_policy = state.signing_policy();
+    let base_fee_stroops = super::submit::selected_signing_fee(&state).await;
     Ok(Envelope::ok(TrustlineSigningInfo {
         account: wallet.stellar_account_g,
         sequence,
         network_passphrase: state.network().passphrase().to_string(),
-        base_fee_stroops: BASE_FEE_STROOPS,
+        base_fee_stroops,
+        max_time: signing_policy.max_time(),
         asset_code,
         asset_issuer,
         // Stellar treats a missing limit as 0 (= remove), so "unlimited" must be explicit.
