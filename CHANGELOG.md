@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `octo-server --check-config`: validates the environment, the mainnet guard, database
+  connectivity and pending migrations, prints a redacted summary and exits non-zero on any
+  failure (#469). Also adds the `Store::ping` the readiness probe already called.
 - Optional OTLP/HTTP span export behind the `otel` cargo feature and
   `OTEL_EXPORTER_OTLP_ENDPOINT` (both off by default), with `traceparent` propagation to
   Horizon and sensitive span fields dropped before export (#468). See `docs/tracing.md`.

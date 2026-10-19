@@ -133,6 +133,30 @@ impl Store {
         &self.pool
     }
 
+    /// One `SELECT 1` round trip: readiness probes and `octo-server --check-config`.
+    pub async fn ping(&self) -> Result<(), StoreError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// How many embedded migrations this database has not successfully applied yet.
+    pub async fn pending_migrations(&self) -> Result<usize, StoreError> {
+        let applied: Vec<i64> =
+            match sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+                .fetch_all(&self.pool)
+                .await
+            {
+                Ok(versions) => versions,
+                // undefined_table: a fresh database that has never been migrated.
+                Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42P01") => Vec::new(),
+                Err(e) => return Err(e.into()),
+            };
+        Ok(MIGRATOR
+            .iter()
+            .filter(|m| !applied.contains(&m.version))
+            .count())
+    }
+
     // --- users ------------------------------------------------------------
 
     /// Create a user. `email` should already be lowercased by the caller. Returns

@@ -7,9 +7,12 @@
 // `octo-server verify-audit-chain [--user <uuid>]` instead verifies the audit hash chain and
 // exits non-zero if any chain is broken (needs only DATABASE_URL and AUDIT_CHAIN_KEY).
 //
-// Built with `--features otel`, spans can be exported over OTLP (see `telemetry.rs`).
+// `octo-server --check-config` validates the environment and database, prints a redacted
+// summary and exits non-zero on any problem. Built with `--features otel`, spans can be exported
+// over OTLP (see `telemetry.rs`).
 #![forbid(unsafe_code)]
 
+mod check_config;
 mod mainnet_guard;
 #[cfg(feature = "otel")]
 mod otlp;
@@ -39,8 +42,9 @@ fn main() -> Result<()> {
     // starts any threads: removing env vars is only sound while nothing else can be reading them.
     let telemetry_cfg = telemetry::TelemetryConfig::from_env()?;
     // The global subscriber may export over OTLP, which needs the runtime; log locally until then.
-    let command =
-        tracing::subscriber::with_default(telemetry::boot_subscriber(), Command::from_env)?;
+    let command = tracing::subscriber::with_default(telemetry::boot_subscriber(), || {
+        Command::from_env(&telemetry_cfg)
+    })?;
 
     let runtime = runtime()?;
     // Entered only for setup: the span exporter spawns its task onto this runtime.
@@ -61,16 +65,24 @@ enum Command {
     MigrateOnly { database_url: String },
     /// `verify-audit-chain [--user <uuid>]`.
     VerifyAuditChain(VerifyConfig),
+    /// `--check-config`: validate everything `serve` needs, print a redacted summary, exit.
+    CheckConfig(Config, check_config::Summary),
     Serve(Config),
 }
 
 impl Command {
-    fn from_env() -> Result<Command> {
+    fn from_env(telemetry: &telemetry::TelemetryConfig) -> Result<Command> {
         match std::env::args().nth(1).as_deref() {
             Some("--migrate-only") => Ok(Command::MigrateOnly {
                 database_url: std::env::var("DATABASE_URL").context("DATABASE_URL is required")?,
             }),
             Some("verify-audit-chain") => Ok(Command::VerifyAuditChain(VerifyConfig::from_env()?)),
+            // A config error surfaces here as a non-zero exit, before anything connects.
+            Some("--check-config") => {
+                let cfg = Config::from_env()?;
+                let summary = check_config::Summary::new(&cfg, telemetry);
+                Ok(Command::CheckConfig(cfg, summary))
+            }
             _ => {
                 let cfg = Config::from_env()?;
                 // Fail closed before touching the DB; exit directly so the operator sees one line.
@@ -94,6 +106,7 @@ impl Command {
                 Ok(())
             }
             Command::VerifyAuditChain(cfg) => verify_audit_chain(cfg).await,
+            Command::CheckConfig(cfg, summary) => check_config::run(cfg, summary).await,
             Command::Serve(cfg) => serve(cfg).await,
         }
     }
