@@ -274,6 +274,12 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::sponsorship::get_config).put(routes::sponsorship::put_config),
         )
         .route("/v1/wallets/:id/sponsor", post(routes::sponsor::sponsor))
+        // Dry run: same validation as /sponsor, no signing and no budget reservation.
+        .route(
+            "/v1/wallets/:id/sponsor/validate",
+            post(routes::sponsor::validate_sponsor)
+                .layer(middleware::from_fn(outbound_route_timeout)),
+        )
         .route(
             "/v1/wallets/:id/sponsored-transactions",
             get(routes::sponsor::list_sponsored_transactions),

@@ -94,6 +94,15 @@ carries fee float only — the one server-held key in the system, bounded by you
 - `POST /v1/wallets/{id}/sponsor` — fee-bump a user's **already-signed** inner transaction.
   The gas tank signs only the outer fee-bump envelope; the inner transaction is passed through
   untouched. Over budget → `429`; duplicate inner tx → `409`.
+- `POST /v1/wallets/{id}/sponsor/validate` — dry run of `/sponsor` with the same body. It runs
+  the **same validation code** (enabled flag, per-tx cap, op allowlist, self-sponsorship,
+  custody, on-chain sequence) plus read-only dedup and daily-budget projections, then returns
+  `200` with `{ verdict: "accepted" | "rejected", reason, rejection_status,
+  projected_fee_stroops, inner_tx_hash, budget_remaining_stroops }`. `rejection_status` and
+  `reason` are the status and message `/sponsor` would answer with. Nothing is signed, reserved,
+  submitted, audited or sent as a webhook. Auth failures and upstream errors (`5xx`) still answer
+  as errors. A dry run is advisory: concurrent sponsorships can still exhaust the budget before
+  the real call.
 - `GET  /v1/wallets/{id}/sponsored-transactions` — sponsorship history (paginated, filterable
   by status).
 

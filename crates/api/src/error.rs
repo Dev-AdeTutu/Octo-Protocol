@@ -40,7 +40,7 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    fn parts(&self) -> (StatusCode, String) {
+    pub(crate) fn parts(&self) -> (StatusCode, String) {
         match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
@@ -105,13 +105,15 @@ impl From<octo_wallet_core::WalletError> for ApiError {
             | W::InvalidAmount
             | W::InvalidDerivationPath
             | W::InvalidXdr
-            | W::InvalidSignature => ApiError::BadRequest("invalid input".into()),
+            | W::InvalidSignature
+            | W::InvalidSeedLength
+            | W::WeakSeed
+            | W::MnemonicAccountMismatch => ApiError::BadRequest("invalid input".into()),
             W::ReservedNativeAssetCode => ApiError::BadRequest(
                 "native asset codes cannot be used as credit asset codes".into(),
             ),
             W::StaleSequence => ApiError::StaleSequence(
                 "Stale sequence number — refresh signing info and rebuild the transaction.".into(),
-            ),
             ),
             W::KeyDerivation | W::Signing | W::SeedDecryption => ApiError::Internal,
         }

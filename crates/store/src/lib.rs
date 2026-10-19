@@ -1989,6 +1989,32 @@ impl Store {
         }
     }
 
+    /// Read-only sponsorship projection for the dry-run endpoint (#463): today's spend counted
+    /// exactly as [`Store::try_reserve_sponsored_transaction`] counts it, and whether
+    /// `inner_tx_hash` was already sponsored. Takes no lock and writes nothing.
+    pub async fn sponsorship_projection(
+        &self,
+        wallet_id: Uuid,
+        inner_tx_hash: &str,
+    ) -> Result<(i64, bool), StoreError> {
+        let row: (i64, bool) = sqlx::query_as(
+            r#"
+            SELECT
+                (SELECT COALESCE(SUM(fee_stroops), 0)::bigint
+                 FROM sponsored_transactions
+                 WHERE wallet_id = $1
+                   AND status IN ('pending', 'confirmed')
+                   AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')),
+                EXISTS (SELECT 1 FROM sponsored_transactions WHERE inner_tx_hash = $2)
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(inner_tx_hash)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Update a sponsored transaction's outcome after submission.
     pub async fn finalize_sponsored_transaction(
         &self,
