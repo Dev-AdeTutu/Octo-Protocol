@@ -38,6 +38,8 @@ pub enum ApiError {
     Internal,
     /// 504 — an upstream dependency (e.g. Horizon) did not answer within the route's time budget.
     GatewayTimeout(String),
+    /// 503 — a dependency needed to make a safe decision (e.g. Horizon) is unavailable.
+    ServiceUnavailable(String),
 }
 
 /// The public error-code catalogue: `(code, HTTP status, meaning)`. Codes are a stable contract —
@@ -123,6 +125,7 @@ impl ApiError {
                 "internal server error".into(),
             ),
             ApiError::GatewayTimeout(m) => (StatusCode::GATEWAY_TIMEOUT, m.clone()),
+            ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m.clone()),
         }
     }
 }

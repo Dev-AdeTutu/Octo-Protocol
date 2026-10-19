@@ -13,6 +13,7 @@ octo-store.workspace = true
 octo-wallet-core.workspace = true
 octo-webhooks.workspace = true
 octo-resilience.workspace = true
+octo-metrics.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

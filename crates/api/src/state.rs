@@ -2,6 +2,7 @@
 
 use crate::error::ApiError;
 use crate::horizon::Horizon;
+use crate::signing_policy::SigningPolicy;
 use base64::Engine;
 use octo_crypto::{CryptoError, MASTER_KEY_LEN};
 use octo_email::EmailSender;
@@ -25,6 +26,7 @@ impl fmt::Debug for AppState {
             .debug_struct("AppState")
             .field("network", &self.inner.network)
             .field("horizon_url", &self.inner.horizon_url)
+            .field("signing_policy", &self.inner.signing_policy)
             .field("friendbot_url", &self.inner.friendbot_url)
             .field("public_app_url", &self.inner.public_app_url)
             .field("public_api_host", &self.inner.public_api_host)
@@ -48,6 +50,7 @@ struct Inner {
     network: StellarNetwork,
     horizon: Horizon,
     horizon_url: String,
+    signing_policy: SigningPolicy,
     friendbot_url: Option<String>,
     /// Base URL of the hosted checkout frontend, used to build the `url` field on payment-link
     /// responses (e.g. `https://app.octo.dev/pay/<slug>`). No trailing slash.
@@ -162,6 +165,12 @@ impl AppState {
         self
     }
 
+    /// Configure parameters returned to clients that build and sign transactions locally.
+    pub fn with_signing_policy(mut self, policy: SigningPolicy) -> Self {
+        Arc::make_mut(&mut self.inner).signing_policy = policy;
+        self
+    }
+
     /// Swap the rate-limit backend (defaults to per-process memory; use Postgres with replicas).
     pub fn with_rate_limiter(mut self, limiter: crate::rate_limit::RateLimiter) -> Self {
         Arc::make_mut(&mut self.inner).rate_limiter = limiter;
@@ -231,6 +240,7 @@ impl AppState {
                 network,
                 horizon,
                 horizon_url,
+                signing_policy: SigningPolicy::default(),
                 friendbot_url,
                 public_app_url,
                 public_api_host: None,
@@ -322,6 +332,10 @@ impl AppState {
 
     pub fn horizon(&self) -> &Horizon {
         &self.inner.horizon
+    }
+
+    pub fn signing_policy(&self) -> SigningPolicy {
+        self.inner.signing_policy
     }
 
     pub fn webhooks(&self) -> &WebhookSender {

@@ -62,6 +62,45 @@ This document serves as the single changelog-style decision index tracking every
 | `0026` | `0026_audit_logs_append_only.sql` | `audit_logs`; functions `audit_logs_retention_allowed`, `audit_logs_block_mutation`, `audit_logs_block_truncate` | `BEFORE UPDATE OR DELETE` row trigger and `BEFORE TRUNCATE` statement trigger raise `insufficient_privilege`. Bypass only for members of `octo_audit_retention` (created out-of-band) or a `DELETE` whose owning `users` row is already gone (FK cascade). Functions pin `search_path = pg_catalog, pg_temp` and schema-qualify `users` via `TG_TABLE_SCHEMA`. | Issue #438: append-only was a convention. A temp table can't spoof the checks; signup rollback still cascades. See `docs/postgres-roles.md`. |
 | `0028` | `0028_rate_limit_buckets.sql` | `rate_limit_buckets` | `UNLOGGED`; PK `(key, class)`; index on `expires_at`; no foreign keys. | Shared fixed-window counters so API rate limits hold across replicas and restarts (Issue #445). Unlogged because losing counters on a Postgres crash only resets windows early. |
 | `0032` | `0032_payment_link_expiry_cancel.sql` | `payment_links`, `payment_link_payments` | Added nullable `expires_at` and `cancelled_at` to `payment_links`; widened the payment status CHECK with `'cancelled'`; partial index on `expires_at` for open links. No new foreign keys. | Issue #454: merchants can time-box and cancel links. Both columns are nullable so existing links stay open-ended; `cancelled_at` is write-once (enforced in the store) so a cancelled link can't be revived. |
+| `0032` | `0032_wallet_ingest_paused.sql` | `wallets` | Added `ingest_paused BOOLEAN NOT NULL DEFAULT false` and `ingest_paused_at TIMESTAMPTZ`; partial index `idx_wallets_ingest_active (network, id) WHERE ingest_paused = false`. No FK changes. | Issue #450: operators can stop polling a misbehaving wallet without deleting it. `ingest_cursor` is never touched by a pause, so resume continues from the saved paging token without gaps. |
+| `0033` | `0033_transaction_history_filters.sql` | `transactions` | Added `idx_tx_wallet_created (wallet_id, created_at DESC, id DESC)` and `idx_tx_wallet_asset_created (wallet_id, asset_code, created_at DESC, id DESC)`; dropped the now-redundant `idx_tx_wallet`. No FK changes (the `RESTRICT` check on `wallet_id` is still served by the composite's leading column). | Issue #451: filtered history (`from`/`to`/`asset`/`status`) with keyset pagination on `(created_at, id)` is answered by one ordered index scan instead of a sort over every wallet row. |
+| `0034` | `0034_idempotency_keys.sql` | `idempotency_keys` | PK `(wallet_id, scope, key)`; `wallet_id` → `wallets(id) ON DELETE CASCADE`; `key` length CHECK 1-255; SHA-256 `request_hash`; nullable `status_code`/`response` (NULL = in progress); index on `expires_at`. | Issue #453: a retried payment-link create replays the stored response instead of creating a duplicate, and reusing a key with a different body is a conflict. Rows expire after 24h and are purged hourly. They cascade with the wallet because they only cache its own responses. |
+
+---
+
+## Migration Lint Rules
+
+CI runs a migration linter (`ci/lint-migrations.sh`) on every PR that touches `crates/store/migrations/`. The linter scans each migration file for statements that can lock a hot table or destroy data, and fails the build unless the statement is either safe or explicitly annotated.
+
+### Flagged statements
+
+| Rule | Pattern | Why it is flagged |
+|---|---|---|
+| `drop-table` | `DROP TABLE ...` | Destroys all rows and dependent objects. |
+| `drop-column` | `ALTER TABLE ... DROP COLUMN ...` | Irreversibly discards data and breaks running code that still selects the column. |
+| `drop-constraint` | `ALTER TABLE ... DROP CONSTRAINT ...` | Silently removes integrity guarantees. |
+| `drop-index` | `DROP INDEX ...` | Can regress hot query paths; also takes an `ACCESS EXCLUSIVE` lock on the table. |
+| `create-index` | `CREATE INDEX ...` (without `CONCURRENTLY`) | Takes a write-blocking `SHARE` lock for the duration of the build. |
+| `alter-type` | `ALTER TABLE ... ALTER COLUMN ... TYPE ...` | Rewrites the whole table under `ACCESS EXCLUSIVE`; on large tables this is a full outage. |
+
+`CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` are allowed and are the preferred form for any table that may hold production traffic.
+
+### Annotated overrides
+
+When a flagged statement is genuinely required (e.g. a baseline migration that creates a brand-new table, or a deliberate data-destroying cleanup), annotate it with a comment on the line immediately above the statement:
+
+```sql
+-- migration-lint: allow <reason>
+CREATE INDEX idx_wallets_user ON wallets (user_id);
+```
+
+The reason is mandatory and must be non-empty; the linter rejects a bare `-- migration-lint: allow`. The annotation applies only to the next non-comment, non-blank line, so each exception must be documented individually. Reviewers should treat every override as a design decision worth questioning.
+
+### Existing exceptions
+
+| Migration | Statement | Reason |
+|---|---|---|
+| `0001_init.sql` | `CREATE INDEX` on newly created tables | Baseline schema; tables are empty at migration time, so a non-concurrent build cannot block traffic. |
 
 ---
 
@@ -70,3 +109,5 @@ This document serves as the single changelog-style decision index tracking every
 > **Mandatory Rule for PRs:**
 > Any PR that adds a new migration file under `crates/store/migrations/` **must** append a new entry to the decision index table above within the same PR.
 > The entry must document the migration version, filename, target schema objects, foreign key `ON DELETE` rules, constraints, and the design rationale.
+>
+> Any PR that adds a `-- migration-lint: allow` override **must** also add a row to the *Existing exceptions* table above explaining why the flagged statement is safe.
