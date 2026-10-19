@@ -801,6 +801,39 @@ impl Store {
         Ok(())
     }
 
+    /// Active wallets on `network` opted into SSE ingest (issue #446), at most `limit` of them.
+    pub async fn streaming_wallets(
+        &self,
+        network: &str,
+        limit: i64,
+    ) -> Result<Vec<Wallet>, StoreError> {
+        let rows = sqlx::query_as::<_, Wallet>(
+            "SELECT * FROM wallets
+             WHERE network = $1 AND ingest_streaming AND NOT ingest_paused AND archived_at IS NULL
+             ORDER BY id LIMIT $2",
+        )
+        .bind(network)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Opt a wallet in or out of SSE ingest; polling remains the fallback either way.
+    pub async fn set_ingest_streaming(&self, wallet_id: Uuid, enabled: bool) -> Result<(), StoreError> {
+        let res = sqlx::query(
+            "UPDATE wallets SET ingest_streaming = $2, updated_at = now() WHERE id = $1",
+        )
+        .bind(wallet_id)
+        .bind(enabled)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
     /// Pause or resume ingestion for a wallet, returning the updated row.
     ///
     /// Only the flag changes — `ingest_cursor` is deliberately left alone so a resume picks up
