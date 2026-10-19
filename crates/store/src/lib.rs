@@ -21,14 +21,18 @@ pub use audit_chain::{AuditChainKey, AuditChainReport, AuditChainStatus, AUDIT_C
 pub use config::{StoreConfig, StoreConfigError};
 pub use error::StoreError;
 pub use models::{
-    Address, ApiKey, AuditLog, DenylistedToken, EmailOtp, GasSponsorshipConfig, NewDeposit,
+    Address, ApiKey, AuditLog, DenylistedToken, EmailOtp, GasSponsorshipConfig,
+    IdempotencyClaim, NewDeposit,
     NewPaymentLink, NewSponsoredTx, PaymentLink, PaymentLinkPayment, PaymentLinkUpdate, Session,
-    SponsoredTransaction, Transaction, User, Wallet, WebhookDelivery, WebhookEndpoint,
+    SponsoredTransaction, Transaction, TransactionFilter, User, Wallet, WebhookDelivery, WebhookEndpoint,
     WhitelistedAddress, Withdrawal, WithdrawalAllowlistConfig,
 };
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
+
+/// How long a stored idempotency key (and its replayable response) lives.
+pub const IDEMPOTENCY_KEY_TTL_SECS: i64 = 24 * 60 * 60;
 
 /// Embedded migrations, applied by [`Store::migrate`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -699,6 +703,8 @@ impl Store {
             SELECT w.* FROM wallets w
             LEFT JOIN ingest_cursor c ON c.wallet_id = w.id
             WHERE w.network = $1
+              -- Paused wallets are never polled; their cursor waits untouched for a resume.
+              AND w.ingest_paused = false
               AND ($6::uuid IS NULL OR w.id > $6)
               -- Never polled, or never saw activity => always due.
               AND (
@@ -750,6 +756,36 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Pause or resume ingestion for a wallet, returning the updated row.
+    ///
+    /// Only the flag changes — `ingest_cursor` is deliberately left alone so a resume picks up
+    /// from the saved paging token with no gap. `ingest_paused_at` keeps the first pause time
+    /// on a repeated pause and is cleared on resume.
+    pub async fn set_ingest_paused(
+        &self,
+        wallet_id: Uuid,
+        paused: bool,
+    ) -> Result<Wallet, StoreError> {
+        sqlx::query_as::<_, Wallet>(
+            r#"
+            UPDATE wallets SET
+                ingest_paused = $2,
+                ingest_paused_at = CASE
+                    WHEN $2 THEN COALESCE(ingest_paused_at, now())
+                    ELSE NULL
+                END,
+                updated_at = now()
+            WHERE id = $1
+            RETURNING *
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(paused)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)
     }
 
     /// Fetch a wallet by id.
@@ -1080,11 +1116,16 @@ impl Store {
         .await?)
     }
 
-    /// Paginated version of [`list_transactions`]: returns at most `limit` rows, newest first.
-    /// Pass the last page's final transaction id as `before_id` to fetch the next page.
+    /// Filtered, keyset-paginated transaction history: at most `limit` rows, newest first.
+    ///
+    /// Pass the last page's final transaction id as `before_id` to fetch the next page. The cursor
+    /// is resolved within this wallet only, and ordering is the total order `(created_at, id)`, so
+    /// pages stay stable under any filter combination — filters only narrow the set. Served by
+    /// `idx_tx_wallet_created` / `idx_tx_wallet_asset_created` (migration 0033).
     pub async fn list_transactions_page(
         &self,
         wallet_id: Uuid,
+        filter: &TransactionFilter,
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Transaction>, StoreError> {
@@ -1093,14 +1134,26 @@ impl Store {
             SELECT * FROM transactions
             WHERE wallet_id = $1
               AND ($2::uuid IS NULL OR (created_at, id) < (
-                    SELECT created_at, id FROM transactions WHERE id = $2
+                    SELECT created_at, id FROM transactions WHERE id = $2 AND wallet_id = $1
                   ))
+              AND ($3::text IS NULL OR direction = $3)
+              AND ($4::text IS NULL OR status = $4)
+              AND ($5::text IS NULL OR asset_code = $5)
+              AND ($6::text IS NULL OR asset_issuer = $6)
+              AND ($7::timestamptz IS NULL OR created_at >= $7)
+              AND ($8::timestamptz IS NULL OR created_at < $8)
             ORDER BY created_at DESC, id DESC
-            LIMIT $3
+            LIMIT $9
             "#,
         )
         .bind(wallet_id)
         .bind(before_id)
+        .bind(filter.direction.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.asset_code.as_deref())
+        .bind(filter.asset_issuer.as_deref())
+        .bind(filter.from)
+        .bind(filter.to)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -2468,6 +2521,119 @@ impl Store {
     /// Delete sessions that expired more than a day ago (kept briefly for incident review).
     pub async fn purge_expired_sessions(&self) -> Result<u64, StoreError> {
         let res = sqlx::query("DELETE FROM sessions WHERE expires_at < now() - interval '1 day'")
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    // --- idempotency keys -------------------------------------------------
+
+    /// Claim `key` for one `scope` of `wallet_id` before running a non-idempotent create.
+    ///
+    /// The insert is atomic, so two concurrent requests with one key can't both win the claim.
+    /// An expired row is taken over as a fresh claim. Otherwise the existing row decides: a
+    /// different `request_hash` is a [`IdempotencyClaim::Mismatch`], a stored response is a
+    /// [`IdempotencyClaim::Replay`], and no response yet is [`IdempotencyClaim::InProgress`].
+    pub async fn claim_idempotency_key(
+        &self,
+        wallet_id: Uuid,
+        scope: &str,
+        key: &str,
+        request_hash: &str,
+    ) -> Result<IdempotencyClaim, StoreError> {
+        let claimed: Option<i32> = sqlx::query_scalar(
+            r#"
+            INSERT INTO idempotency_keys (wallet_id, scope, key, request_hash, expires_at)
+            VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))
+            ON CONFLICT (wallet_id, scope, key) DO UPDATE SET
+                request_hash = EXCLUDED.request_hash,
+                status_code = NULL,
+                response = NULL,
+                created_at = now(),
+                expires_at = EXCLUDED.expires_at
+            WHERE idempotency_keys.expires_at <= now()
+            RETURNING 1
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(scope)
+        .bind(key)
+        .bind(request_hash)
+        .bind(IDEMPOTENCY_KEY_TTL_SECS as f64)
+        .fetch_optional(&self.pool)
+        .await?;
+        if claimed.is_some() {
+            return Ok(IdempotencyClaim::Claimed);
+        }
+
+        let (stored_hash, status_code, response): (String, Option<i16>, Option<serde_json::Value>) =
+            sqlx::query_as(
+                "SELECT request_hash, status_code, response FROM idempotency_keys
+                 WHERE wallet_id = $1 AND scope = $2 AND key = $3",
+            )
+            .bind(wallet_id)
+            .bind(scope)
+            .bind(key)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(if stored_hash != request_hash {
+            IdempotencyClaim::Mismatch
+        } else {
+            match (status_code, response) {
+                (Some(code), Some(response)) => IdempotencyClaim::Replay {
+                    status_code: u16::try_from(code).unwrap_or(500),
+                    response,
+                },
+                _ => IdempotencyClaim::InProgress,
+            }
+        })
+    }
+
+    /// Store the finished response for a claimed key so later retries replay it.
+    pub async fn complete_idempotency_key(
+        &self,
+        wallet_id: Uuid,
+        scope: &str,
+        key: &str,
+        status_code: u16,
+        response: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE idempotency_keys SET status_code = $4, response = $5
+             WHERE wallet_id = $1 AND scope = $2 AND key = $3 AND response IS NULL",
+        )
+        .bind(wallet_id)
+        .bind(scope)
+        .bind(key)
+        .bind(i16::try_from(status_code).unwrap_or(500))
+        .bind(response)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Release an unfinished claim after the operation failed, so the client can retry the key.
+    pub async fn release_idempotency_key(
+        &self,
+        wallet_id: Uuid,
+        scope: &str,
+        key: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "DELETE FROM idempotency_keys
+             WHERE wallet_id = $1 AND scope = $2 AND key = $3 AND response IS NULL",
+        )
+        .bind(wallet_id)
+        .bind(scope)
+        .bind(key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete expired idempotency keys; called by the hourly maintenance loop.
+    pub async fn purge_expired_idempotency_keys(&self) -> Result<u64, StoreError> {
+        let res = sqlx::query("DELETE FROM idempotency_keys WHERE expires_at <= now()")
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected())

@@ -143,6 +143,7 @@ pub fn build_router(state: AppState) -> Router {
             header::CONTENT_TYPE,
             header::ACCEPT,
             REQUEST_ID_HEADER.clone(),
+            HeaderName::from_static("idempotency-key"),
         ]);
 
     // NOTE: the body-limit layer used to be applied here, to an *empty* router — layers only
@@ -199,6 +200,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/wallets/:id", get(routes::wallets::get_wallet))
         .route("/v1/wallets/:id/archive", patch(routes::wallets::archive_wallet))
         .route("/v1/wallets/:id/unarchive", patch(routes::wallets::unarchive_wallet))
+        .route("/v1/wallets/:id/ingest/pause", patch(routes::wallets::pause_ingest))
+        .route("/v1/wallets/:id/ingest/resume", patch(routes::wallets::resume_ingest))
         .route(
             "/v1/wallets/:id/balances",
             get(routes::wallets::get_balances)
@@ -207,6 +210,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/wallets/:id/transactions",
             get(routes::wallets::list_transactions),
+        )
+        .route(
+            "/v1/wallets/:id/transactions.csv",
+            get(routes::transactions_csv::export_transactions_csv),
         )
         .route(
             "/v1/wallets/:id/addresses",

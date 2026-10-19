@@ -60,7 +60,27 @@ decrypt. Consequently:
 - `GET  /v1/wallets` — list your wallets (paginated).
 - `GET  /v1/wallets/{id}` — wallet details.
 - `GET  /v1/wallets/{id}/balances` — live on-chain balances.
-- `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated).
+- `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated). Optional
+  filters compose with each other and with `?before=` keyset pagination:
+  `direction` (`deposit`|`withdrawal`), `status` (`pending`|`confirmed`|`failed`), `asset`
+  (`native`/`XLM`, a code such as `USDC` for any issuer, or `CODE:ISSUER`), `from` (inclusive)
+  and `to` (exclusive) as RFC 3339 timestamps or `YYYY-MM-DD` (midnight UTC). Any invalid value,
+  or `from` not earlier than `to`, is `400`. A `before` cursor from another wallet yields an empty
+  page.
+- `GET  /v1/wallets/{id}/transactions.csv` — the same history as an accounting CSV download
+  (`text/csv`, `Content-Disposition: attachment`, `Cache-Control: no-store`). Same auth and the
+  same filters as the JSON endpoint, but no pagination: rows stream newest first in batches of
+  500, so memory is bounded however long the history is. Columns: `id, created_at, direction,
+  status, asset_code, asset_issuer, amount_stroops, source_account, destination_account,
+  stellar_tx_hash, operation_index, ledger, memo_id, address_id, reference`. Text cells starting
+  with `=`, `+`, `-`, `@`, tab or CR are prefixed with `'` so spreadsheets never evaluate them.
+  If the database fails mid-export the connection is aborted rather than ending cleanly, so a
+  partial file is never mistaken for a complete one.
+- `PATCH /v1/wallets/{id}/ingest/pause` / `PATCH /v1/wallets/{id}/ingest/resume` — stop or
+  restart deposit polling for one wallet. **Dashboard JWT only**, owner-only, audit-logged.
+  The ingest cursor is kept while paused, so resume continues from where polling stopped with no
+  gap; a pause takes effect from the supervisor's next tick. Wallet views expose
+  `ingest_paused` and `ingest_paused_at`.
 - `GET  /v1/wallets/{id}/backup` — the opaque client-encrypted backup blob, for new-device
   recovery. **Dashboard JWT only.** Useless without the user's password. Rate-limited to 5
   requests per hour per user (`429` beyond that); every successful read writes an audit row, and
@@ -131,6 +151,15 @@ deliveries (its `auto_disabled_at` is then set); unset means never.
 
 ## Payment links
 
+- `POST   /v1/wallets/{id}/payment-links` accepts an optional `Idempotency-Key` header (1-255
+  visible ASCII characters, scoped to the wallet):
+  - A retry with the same key and the **byte-identical** body returns the original `201`
+    response with `Idempotent-Replayed: true` and creates nothing new.
+  - The same key with a different body is `409`. So is a retry while the first request is
+    still running.
+  - A request that fails (e.g. `400`) frees its key, so a corrected retry can reuse it.
+  - Keys expire **24 hours** after first use (`IDEMPOTENCY_KEY_TTL_SECS`), after which the key
+    starts fresh.
 - `PATCH  /v1/wallets/{id}/payment-links/{link_id}` — edit `description`, `redirect_url` and
   `amount_usdc_stroops` (omit to keep, `null` to clear). Allowed only while no payment is
   pending or has landed; otherwise `409`. Edits are audit-logged.
@@ -180,6 +209,7 @@ Counters are shared across replicas through Postgres by default (`RATE_LIMIT_BAC
 | `/v1/pay/:slug/payments/:payment_id` | GET | Per-IP | 60 req | 60s (1m) | `PAY_STATUS_LIMIT` / `PAY_STATUS_WINDOW` |
 | `/v1/pay/:slug/signing-info` | GET | Per-IP | 60 req | 60s (1m) | `PAY_SIGNING_INFO_LIMIT` / `PAY_SIGNING_INFO_WINDOW` |
 | `/v1/pay/:slug/submit-signed` | POST | Per-IP | 20 req | 60s (1m) | `PAY_SUBMIT_LIMIT` / `PAY_SUBMIT_WINDOW` |
+| `/v1/wallets/:id/transactions.csv` | GET | Per-Wallet (`csv_export:{wallet_id}`) | 10 req | 60s (1m) | `CSV_EXPORT_LIMIT` / `CSV_EXPORT_WINDOW` |
 
 > [!NOTE]
 > **Process Note:** Any new rate limit added to the API must update this table and reference named constants in `crates/api/src/rate_limit.rs` within the same pull request.
