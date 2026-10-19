@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Account data export and deletion, each gated by password plus an emailed OTP. Deletion is
   refused while any wallet holds funds, tombstones the user and anonymises (and re-links) the
   retained audit chain; the export contains no secrets (#466).
+- Email: transient Resend failures (429/5xx/timeouts) are retried with backoff under a 25s
+  overall deadline and 4xx is never retried (#470); delivery sits behind an `EmailTransport`
+  trait with Resend, capture, log-only and failing implementations, and the `test-fixtures`
+  feature is gone (#471); every template ships an HTML and a plain-text part (#472).
+- Withdrawals are recorded `pending` before submission and a background reconciler settles
+  stale ones by transaction hash, distinguishing not-found from timebound-expired (#473).
 - API: every error response carries a stable machine-readable `code` (catalogue in
   `docs/api.md` and `ErrorResponse.code` in `docs/openapi.yaml`, pinned by a snapshot test).
   Framework rejections, unknown routes and 405s now use the JSON error envelope too (#465).

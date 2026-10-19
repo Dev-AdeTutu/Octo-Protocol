@@ -1,0 +1,31 @@
+[package]
+name = "octo-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+octo-api = { path = "../crates/api" }
+octo-wallet-core = { path = "../crates/wallet-core" }
+
+[[bin]]
+name = "sponsor_validation"
+path = "fuzz_targets/sponsor_validation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "submit_validation"
+path = "fuzz_targets/submit_validation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "strkey_decode"
+path = "fuzz_targets/strkey_decode.rs"
+test = false
+doc = false

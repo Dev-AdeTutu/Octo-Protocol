@@ -109,8 +109,12 @@ async fn preflight(state: &AppState, wallet_id: Uuid, req: SponsorRequest) -> Ap
         }
     }
 
-    // 3. Validate the inner XDR (op allowlist + no self-sponsorship). Pure, no I/O.
-    validate_inner_xdr(&inner_xdr, &wallet.stellar_account_g)?;
+    // 3. Validate the inner XDR (global + per-wallet op allowlist, no self-sponsorship) before signing.
+    validate_inner_xdr(
+        &inner_xdr,
+        &wallet.stellar_account_g,
+        config.allowed_operations.as_deref(),
+    )?;
 
     // A client-custody wallet has no server-side key to pay fees from; refuse before reserving.
     if wallet.sealed_ciphertext.is_none()

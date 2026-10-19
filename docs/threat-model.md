@@ -66,7 +66,7 @@ responsible for the largest share of real-world crypto theft.
 | **Memo-less / wrong-memo deposit** misattribution | Attribute strictly by muxed id **or** a valid numeric memo id that maps to a known address; unmatched deposits go to a **quarantine/unattributed** state, never auto-credited to a guess | 8 |
 | Replayed Horizon events | Cursor is monotonic + dedup by tx hash; reprocessing the same payment is a no-op | 8 |
 | Spoofed asset / fake token deposit | Credit only **whitelisted assets** (issuer + code must match an enabled asset); ignore unknown trustlines/tokens | 8, later (asset mgmt) |
-| Claimable-balance side-channel | Treat claimable balances explicitly; do not credit until claimed into the master under our control | 8 (documented), later |
+| Claimable-balance side-channel | Treat claimable balances explicitly; credit only on a successful `claim_claimable_balance` **by the master account**, for the amount in its `account_credited` effect; reclaims of our own balances are not deposits (see `docs/deposit-model.md`) | 8, #448 |
 | Dust / griefing to inflate accounting | Minimum-amount thresholds; amounts stored as exact integers (stroops), never floats | 8 |
 
 ### D. Outbound transfer attacks

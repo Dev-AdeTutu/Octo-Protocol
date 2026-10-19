@@ -70,6 +70,10 @@ db-reset:
 run:
     cargo run -p octo-server
 
+# Seed the local database with development data.
+seed:
+    cargo run -p octo-seed
+
 # Run the Bruno API-tests integration suite non-interactively against a local server.
 test-integration:
     #!/usr/bin/env bash

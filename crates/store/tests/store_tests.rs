@@ -8,8 +8,8 @@
 //! green). If a URL is found but the DB is unreachable, the test fails loudly with the reason.
 
 use octo_store::{
-    IdempotencyClaim, NewDeposit, NewPaymentLink, NewSponsoredTx, NewWallet, NewWithdrawal, Store, StoreError,
-    TransactionFilter,
+    IdempotencyClaim, NewAddress, NewDeposit, NewPaymentLink, NewSponsoredTx, NewWallet,
+    NewWithdrawal, Store, StoreError, TransactionFilter,
 };
 use std::sync::Once;
 use uuid::Uuid;
@@ -183,6 +183,80 @@ async fn different_op_index_same_tx_is_distinct() {
             .len(),
         2
     );
+}
+
+/// Batch entries with the given references (`None` = no reference).
+fn batch(refs: &[Option<&'static str>]) -> Vec<NewAddress<'static>> {
+    refs.iter()
+        .map(|r| NewAddress {
+            customer_ref: *r,
+            metadata: serde_json::json!({}),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn allocate_addresses_reserves_a_contiguous_block() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let wid = wallet_id.simple();
+
+    let rows = store
+        .allocate_addresses(wallet_id, |id| Ok(format!("M{wid}-{id}")), batch(&[Some("x"), None, Some("y")]))
+        .await
+        .expect("batch");
+    assert_eq!(rows.iter().map(|a| a.muxed_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(store.get_wallet(wallet_id).await.unwrap().next_muxed_id, 4);
+}
+
+#[tokio::test]
+async fn allocate_addresses_is_all_or_nothing() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let wid = wallet_id.simple();
+    store
+        .allocate_address(wallet_id, |id| Ok(format!("M{wid}-{id}")), Some("taken"), serde_json::json!({}))
+        .await
+        .expect("seed");
+
+    // The last entry collides with an existing reference: nothing from the batch may persist.
+    let err = store
+        .allocate_addresses(wallet_id, |id| Ok(format!("M{wid}-{id}")), batch(&[Some("new-1"), None, Some("taken")]))
+        .await
+        .expect_err("duplicate ref must fail the batch");
+    assert!(matches!(err, StoreError::DuplicateCustomerRef), "got {err:?}");
+    assert_eq!(store.list_addresses(wallet_id, 100, None).await.unwrap().len(), 1);
+    // The counter bump rolled back too.
+    assert_eq!(store.get_wallet(wallet_id).await.unwrap().next_muxed_id, 2);
+}
+
+#[tokio::test]
+async fn concurrent_address_batches_never_collide() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let wid = wallet_id.simple();
+
+    let tasks: Vec<_> = (0..8)
+        .map(|_| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .allocate_addresses(wallet_id, |id| Ok(format!("M{wid}-{id}")), batch(&[None; 25]))
+                    .await
+                    .expect("batch")
+            })
+        })
+        .collect();
+    let mut ids = Vec::new();
+    for t in tasks {
+        let rows = t.await.unwrap();
+        // Each batch holds one contiguous block.
+        let block: Vec<i64> = rows.iter().map(|a| a.muxed_id).collect();
+        assert!(block.windows(2).all(|w| w[1] == w[0] + 1), "non-contiguous block {block:?}");
+        ids.extend(block);
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, (1..=200).collect::<Vec<i64>>());
 }
 
 #[tokio::test]
@@ -869,7 +943,7 @@ async fn upsert_gas_sponsorship_config_works() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;
     let cfg = store
-        .upsert_gas_sponsorship_config(wallet_id, true, Some(500_000), Some(10_000_000))
+        .upsert_gas_sponsorship_config(wallet_id, true, Some(500_000), Some(10_000_000), None)
         .await
         .expect("upsert");
     assert!(cfg.enabled);
@@ -878,6 +952,32 @@ async fn upsert_gas_sponsorship_config_works() {
         .await
         .expect("sum");
     assert_eq!(spent, 0);
+}
+
+#[tokio::test]
+async fn sponsorship_allowed_operations_persist_until_explicitly_reset() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let payments = vec!["Payment".to_string()];
+
+    let cfg = store
+        .upsert_gas_sponsorship_config(wallet_id, true, None, None, Some(Some(&payments[..])))
+        .await
+        .expect("set list");
+    assert_eq!(cfg.allowed_operations.as_deref(), Some(&payments[..]));
+
+    // An update that omits the list must not widen the wallet back to the global set.
+    let cfg = store
+        .upsert_gas_sponsorship_config(wallet_id, false, Some(1_000), None, None)
+        .await
+        .expect("unrelated update");
+    assert_eq!(cfg.allowed_operations.as_deref(), Some(&payments[..]));
+
+    let cfg = store
+        .upsert_gas_sponsorship_config(wallet_id, true, None, None, Some(None))
+        .await
+        .expect("reset");
+    assert_eq!(cfg.allowed_operations, None);
 }
 
 /// Create a throwaway user with a unique email (so tests don't collide).

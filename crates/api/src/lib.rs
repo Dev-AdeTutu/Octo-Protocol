@@ -16,7 +16,9 @@ pub mod signing_policy;
 pub mod sponsor_validation;
 mod state;
 pub mod submit_validation;
+pub mod validation;
 pub mod withdrawal_estimate;
+pub mod withdrawal_reconciler;
 
 pub use error::{code_for_status, ApiError, ApiResult, Envelope, ERROR_CODES};
 pub use signing_policy::SigningPolicy;
@@ -285,7 +287,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/challenge",
             get(routes::wallets::wallet_challenge),
         )
-        .route("/v1/wallets/:id", get(routes::wallets::get_wallet))
+        .route(
+            "/v1/wallets/:id",
+            get(routes::wallets::get_wallet).patch(routes::wallets::update_wallet),
+        )
         .route("/v1/wallets/:id/archive", patch(routes::wallets::archive_wallet))
         .route("/v1/wallets/:id/unarchive", patch(routes::wallets::unarchive_wallet))
         .route("/v1/wallets/:id/ingest/pause", patch(routes::wallets::pause_ingest))
@@ -306,6 +311,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/wallets/:id/addresses",
             post(routes::addresses::create_address).get(routes::addresses::list_addresses),
+        )
+        .route(
+            "/v1/wallets/:id/addresses/batch",
+            post(routes::addresses::create_addresses_batch),
         )
         .route(
             "/v1/wallets/:id/webhooks",

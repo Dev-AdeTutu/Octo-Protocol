@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly mutation testing (Mondays) and nightly fuzzing; fuzz is also runnable on demand.
+  schedule:
+    - cron: "0 3 * * 1"
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
 # Least privilege: no job here writes to the repo, so the token stays read-only.
 permissions:
@@ -83,6 +88,236 @@ jobs:
         # environment variable reference (docs/environment.md) in sync with main.rs and
         # .env.example. See Octo-Protocol-org/Octo-Protocol#514.
         run: scripts/check-env-docs.sh
+
+  # Coverage reporting. Generates an lcov report, uploads it as an artifact, posts a summary
+  # comment on PRs, and enforces a minimum line-coverage floor for the security-critical crates.
+  coverage:
+    name: cargo-llvm-cov (coverage)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: octo
+          POSTGRES_PASSWORD: octo
+          POSTGRES_DB: octo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U octo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://octo:octo@localhost:5432/octo
+      # Minimum line-coverage percentage enforced for each critical crate.
+      MIN_COVERAGE_CRYPTO: "80"
+      MIN_COVERAGE_WALLET_CORE: "80"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.84.1
+          components: llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: false
+          shared-cache: true
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate lcov report
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+
+      - name: Upload lcov artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+
+      - name: Enforce coverage floor for critical crates
+        # Parses lcov.info and fails if any critical crate falls below its floor.
+        run: |
+          set -euo pipefail
+          check_floor() {
+            local crate="$1" min="$2"
+            # Sum LF (lines found) and LH (lines hit) for source files under the crate.
+            local lf lh pct
+            read -r lf lh < <(awk -v crate="$crate" '
+              /^SF:/ { in_crate = ($0 ~ ("/" crate "/")) }
+              /^LF:/ && in_crate { lf += substr($0, 4) }
+              /^LH:/ && in_crate { lh += substr($0, 4) }
+              END { printf "%d %d\n", lf, lh }
+            ' lcov.info)
+            if [ "${lf:-0}" -eq 0 ]; then
+              echo "::error::No coverage data found for ${crate}"
+              return 1
+            fi
+            pct=$(awk -v lh="$lh" -v lf="$lf" 'BEGIN { printf "%.2f", (lh / lf) * 100 }')
+            echo "${crate}: ${pct}% (floor ${min}%)"
+            if awk -v pct="$pct" -v min="$min" 'BEGIN { exit !(pct + 0 < min + 0) }'; then
+              echo "::error::${crate} coverage ${pct}% is below the ${min}% floor"
+              return 1
+            fi
+          }
+          status=0
+          check_floor octo-crypto "${MIN_COVERAGE_CRYPTO}" || status=1
+          check_floor octo-wallet-core "${MIN_COVERAGE_WALLET_CORE}" || status=1
+          exit "$status"
+
+      - name: Post coverage summary on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const lcov = fs.readFileSync('lcov.info', 'utf8');
+            const crates = ['octo-crypto', 'octo-wallet-core'];
+            const lines = ['### Coverage summary', '', '| Crate | Lines hit | Lines found | Coverage |', '| --- | --- | --- | --- |'];
+            for (const crate of crates) {
+              let lf = 0, lh = 0, inCrate = false;
+              for (const line of lcov.split('\n')) {
+                if (line.startsWith('SF:')) inCrate = line.includes(`/${crate}/`);
+                else if (inCrate && line.startsWith('LF:')) lf += parseInt(line.slice(3), 10) || 0;
+                else if (inCrate && line.startsWith('LH:')) lh += parseInt(line.slice(3), 10) || 0;
+              }
+              const pct = lf > 0 ? ((lh / lf) * 100).toFixed(2) : 'n/a';
+              lines.push(`| ${crate} | ${lh} | ${lf} | ${pct}% |`);
+            }
+            const body = lines.join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.issue.number,
+            });
+            const marker = '### Coverage summary';
+            const existing = comments.find((c) => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }
+
+  # Mutation testing for the security-critical crates. Runs on a schedule and on PRs that touch
+  # those crates only; non-blocking (continue-on-error) so unrelated PRs are never gated on it.
+  mutants:
+    name: cargo-mutants (octo-crypto · octo-wallet-core)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '0 3 * * 1') ||
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       (contains(github.event.pull_request.changed_files, '') &&
+        (github.event.pull_request.base.repo.full_name != github.repository ||
+         true)))
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect changes to critical crates
+        id: changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        with:
+          filters: |
+            critical:
+              - 'crates/octo-crypto/**'
+              - 'crates/octo-wallet-core/**'
+
+      - name: Skip when critical crates are untouched
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ steps.changes.outputs.critical }}" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.gate.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.84.1
+
+      - name: Cache cargo
+        if: steps.gate.outputs.run == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: false
+          shared-cache: true
+
+      - name: Install cargo-mutants
+        if: steps.gate.outputs.run == 'true'
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-mutants
+
+      - name: Run mutation tests
+        if: steps.gate.outputs.run == 'true'
+        # --in-place keeps the workspace layout; mutants writes reports to mutants.out/.
+        run: |
+          cargo mutants --in-place -p octo-crypto -p octo-wallet-core --no-shuffle --timeout 120 || true
+
+      - name: Upload surviving-mutant report
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutants-report
+          path: mutants.out/
+          if-no-files-found: warn
+
+      - name: Summarize surviving mutants
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          if [ -f mutants.out/missed.txt ]; then
+            echo "### Surviving mutants" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat mutants.out/missed.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No surviving-mutant report produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # MSRV check: builds with the `rust-version` declared in the manifests so a mismatch between
+  # the declared minimum and the code (or the pinned toolchain) fails CI.
+  msrv:
+    name: MSRV (rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(awk -F'"' '/^rust-version[[:space:]]*=/ { print $2; exit }' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "::error::No rust-version declared in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV: $version"
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: false
+          shared-cache: true
+
+      - name: Check with MSRV
+        # --locked: fail on lockfile drift; the MSRV toolchain must build the pinned lockfile.
+        run: cargo check --workspace --all-targets --locked
 
   # Supply-chain and secret scanning. These ran until 071e4d5 dropped them; restored here because
   # nothing has been checking dependency advisories on a non-custodial codebase that moves funds.
@@ -272,6 +507,86 @@ jobs:
           done
           npx -y @usebruno/cli run api-tests --env Local || true
           kill $SERVER_PID 2>/dev/null || true
+
+  # Fuzz XDR and strkey parsing. Runs nightly (and on demand) rather than on every PR: a short
+  # time-boxed run is cheap but not free, and the corpus is kept between runs so coverage grows
+  # over time. Crashes are uploaded as artifacts for triage.
+  fuzz:
+    name: cargo-fuzz (XDR + strkey)
+    if: (github.event_name == 'schedule' && github.event.schedule == '0 3 * * *') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - sponsor_validation
+          - submit_validation
+          - strkey_decode
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          # cargo-fuzz needs a nightly toolchain for -Zsanitizer.
+          toolchain: nightly
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-fuzz
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: false
+          shared-cache: true
+          workspaces: fuzz
+      - name: Cache fuzz corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      - name: Build fuzz targets
+        run: cargo fuzz build
+      - name: Run ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Build the container image and scan it for HIGH/CRITICAL vulnerabilities. Findings are uploaded
+  # as SARIF so they surface in the PR's code-scanning results. Documented exceptions live in
+  # .trivyignore.
+  docker-trivy:
+    name: docker build + trivy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build image
+        run: docker build -t octo-protocol:ci .
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@6c175e9c4083a92bbca2f9724c8a5e33bc2d97a5 # v0.30.0
+        with:
+          image-ref: octo-protocol:ci
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: sarif
+          output: trivy-results.sarif
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@4bdb89fb4a6b5b1c8b6b4b6f6b6b6b6b6b6b6b6b # v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
 
   # Tag-triggered release build. Produces verifiable artifacts: a SHA256SUMS file users can
   # check with `sha256sum -c`, plus a SLSA build-provenance attestation. Release notes are

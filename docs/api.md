@@ -87,6 +87,10 @@ decrypt. Consequently:
   **Never returns a mnemonic** — the client generated it and the server never saw it.
 - `GET  /v1/wallets` — list your wallets (paginated).
 - `GET  /v1/wallets/{id}` — wallet details.
+- `PATCH /v1/wallets/{id}` — rename or annotate a wallet. Body: `{ "label"?: string|null,
+  "description"?: string|null }` — omit a field to keep it, `null` or `""` to clear it. `label` ≤ 64
+  characters, `description` ≤ 500; control and invisible formatting characters are `400`. Owner
+  login or a `write`-scoped API key; archived wallets are `403`. Audit-logged.
 - `GET  /v1/wallets/{id}/balances` — live on-chain balances.
 - `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated). Optional
   filters compose with each other and with `?before=` keyset pagination:
@@ -159,8 +163,16 @@ trustline → `400`.
 ## Addresses
 
 - `POST /v1/wallets/{id}/addresses` — generate a dedicated customer address.
-  Returns `muxed_address` (`M...`) **and** the `{ base_address, memo_id }` fallback.
-- `GET  /v1/wallets/{id}/addresses` — list addresses (paginated).
+  Body: `{ "customer_ref"?: string, "metadata"?: object }`. Returns `muxed_address` (`M...`)
+  **and** the `{ base_address, memo_id }` fallback. `customer_ref` (≤ 128 characters, trimmed, no
+  control characters) is unique per wallet: reusing one on the same wallet is `409`.
+- `POST /v1/wallets/{id}/addresses/batch` — allocate many addresses at once. Body:
+  `{ "addresses": [{ "customer_ref"?: string, "metadata"?: object }, ...] }`, 1–100 entries.
+  All-or-nothing: if any entry fails (a bad or duplicate `customer_ref` → `400`/`409`) no address
+  is created. Each batch gets a contiguous, collision-free block of muxed ids even under
+  concurrent batches. Returns `201` with `{ data: [address, ...] }` in request order.
+- `GET  /v1/wallets/{id}/addresses` — list addresses (paginated). `?customer_ref=` returns just
+  the address with that reference (an empty list if none).
 
 ## Gas sponsorship
 
@@ -170,7 +182,13 @@ carries fee float only — the one server-held key in the system, bounded by you
 - `POST /v1/wallets/{id}/gas-tank` — provision the gas tank. **Dashboard JWT only** (an API key
   gets `401`). Idempotent: a second call returns the existing tank.
 - `GET  /v1/wallets/{id}/sponsorship` / `PUT` — read/update `enabled`, the per-transaction fee
-  cap, and the daily budget.
+  cap, the daily budget, and `allowed_operations`. `allowed_operations` narrows the global
+  sponsorship allowlist (`Payment`, `PathPaymentStrictSend`, `PathPaymentStrictReceive`) for this
+  wallet: send a non-empty subset to restrict, `null` to inherit the global list, or omit it to
+  keep the current setting. Anything outside the global list is `400`. The response also reports
+  `effective_allowed_operations`.
+- `POST /v1/wallets/{id}/sponsor` rejects (`400 op_not_allowed`) any operation outside the
+  wallet's effective allowlist before anything is signed.
 - `POST /v1/wallets/{id}/sponsor` — fee-bump a user's **already-signed** inner transaction.
   The gas tank signs only the outer fee-bump envelope; the inner transaction is passed through
   untouched. Over budget → `429`; duplicate inner tx → `409`.

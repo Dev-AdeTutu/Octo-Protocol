@@ -38,6 +38,10 @@ pub enum StoreError {
     #[error("wallet is archived")]
     WalletArchived,
 
+    /// An address with this `customer_ref` already exists on the wallet.
+    #[error("customer_ref already in use for this wallet")]
+    DuplicateCustomerRef,
+
     /// The audit hash chain for a user is malformed, so it must not be extended.
     #[error("audit chain is corrupt")]
     AuditChainCorrupt,
@@ -50,6 +54,10 @@ impl StoreError {
         if let sqlx::Error::Database(ref dbe) = err {
             // Postgres unique_violation = SQLSTATE 23505.
             if dbe.code().as_deref() == Some("23505") {
+                // A duplicate customer reference gets its own actionable error.
+                if dbe.constraint() == Some("idx_addresses_wallet_customer_ref") {
+                    return StoreError::DuplicateCustomerRef;
+                }
                 return StoreError::Conflict;
             }
         }

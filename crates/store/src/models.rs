@@ -38,6 +38,8 @@ pub struct Wallet {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub archived_at: Option<DateTime<Utc>>,
+    /// Opted into Horizon SSE ingest (migration 0032); polling still covers it when the stream is down.
+    pub ingest_streaming: bool,
     /// When true the ingest supervisor skips this wallet; its cursor is left untouched.
     pub ingest_paused: bool,
     pub ingest_paused_at: Option<DateTime<Utc>>,
@@ -274,6 +276,8 @@ pub struct GasSponsorshipConfig {
     pub daily_budget_stroops: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Operation types this wallet may sponsor; `None` = the global allowlist. Can only narrow it.
+    pub allowed_operations: Option<Vec<String>>,
 }
 
 /// The withdrawal-allowlist config for a wallet (one row per wallet).
