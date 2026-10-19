@@ -420,6 +420,17 @@ impl Ingestor {
             }
         };
 
+        // Late deposit (#454): a cancelled or expired link matches nothing; the funds stay a plain
+        // deposit (deposit.created already fired) for the merchant to reconcile or refund.
+        if link.is_closed_at(tx.created_at) {
+            tracing::info!(
+                payment_id = %payment.id,
+                link_status = link.status_at(tx.created_at),
+                "deposit landed after payment link closed; not matched"
+            );
+            return;
+        }
+
         // Exact match confirms; anything else is a mismatch the merchant/payer must be told
         // about — never silently absorbed as if it were correct, and never confirmed either.
         if tx.amount_stroops != payment.amount_usdc_stroops {

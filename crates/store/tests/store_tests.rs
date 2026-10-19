@@ -410,6 +410,7 @@ async fn payment_link_lifecycle_intent_confirm_and_sum() {
             image_url: None,
             redirect_url: None,
             amount_usdc_stroops: None,
+            expires_at: None,
         })
         .await
         .expect("create link");
@@ -547,6 +548,7 @@ async fn payment_link_mismatched_deposit_records_the_transaction_but_does_not_co
             image_url: None,
             redirect_url: None,
             amount_usdc_stroops: Some(10_000_000),
+            expires_at: None,
         })
         .await
         .expect("create link");
@@ -627,6 +629,7 @@ async fn expire_stale_payment_link_payments_only_sweeps_old_pending_rows() {
             image_url: None,
             redirect_url: None,
             amount_usdc_stroops: Some(10_000_000),
+            expires_at: None,
         })
         .await
         .expect("create link");

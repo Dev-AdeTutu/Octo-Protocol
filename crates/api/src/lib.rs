@@ -17,9 +17,10 @@ pub mod sponsor_validation;
 mod state;
 pub mod submit_validation;
 pub mod validation;
+pub mod withdrawal_estimate;
 pub mod withdrawal_reconciler;
 
-pub use error::{ApiError, ApiResult, Envelope};
+pub use error::{code_for_status, ApiError, ApiResult, Envelope, ERROR_CODES};
 pub use signing_policy::SigningPolicy;
 pub use state::AppState;
 
@@ -120,6 +121,44 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
         );
     }
     response
+}
+
+/// Longest framework rejection text carried over as the envelope `message`.
+const REJECTION_MESSAGE_LIMIT: usize = 512;
+
+/// Wrap framework-generated errors (extractor rejections, unknown routes, 405, oversized bodies)
+/// in the standard error envelope with a `code`, so every error a client sees is machine-readable.
+async fn error_envelope_middleware(req: Request, next: Next) -> Response {
+    let response = next.run(req).await;
+    let status = response.status();
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if !(status.is_client_error() || status.is_server_error()) || is_json {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let detail = axum::body::to_bytes(body, REJECTION_MESSAGE_LIMIT)
+        .await
+        .ok()
+        .and_then(|b| String::from_utf8(b.to_vec()).ok())
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    let message = detail.unwrap_or_else(|| {
+        status
+            .canonical_reason()
+            .unwrap_or("error")
+            .to_ascii_lowercase()
+    });
+    let mut wrapped = error::error_response(status, code_for_status(status), message);
+    // A 405 must keep advertising the methods the route does accept.
+    if let Some(allow) = parts.headers.get(header::ALLOW) {
+        wrapped.headers_mut().insert(header::ALLOW, allow.clone());
+    }
+    wrapped
 }
 
 async fn secret_response_cache_middleware(req: Request, next: Next) -> Response {
@@ -328,6 +367,11 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::submit::withdraw_confirm),
         )
         .route(
+            "/v1/wallets/:id/withdraw/estimate",
+            get(routes::submit::withdraw_estimate)
+                .layer(middleware::from_fn(outbound_route_timeout)),
+        )
+        .route(
             "/v1/wallets/:id/signing-info",
             get(routes::submit::signing_info),
         )
@@ -341,6 +385,12 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::sponsorship::get_config).put(routes::sponsorship::put_config),
         )
         .route("/v1/wallets/:id/sponsor", post(routes::sponsor::sponsor))
+        // Dry run: same validation as /sponsor, no signing and no budget reservation.
+        .route(
+            "/v1/wallets/:id/sponsor/validate",
+            post(routes::sponsor::validate_sponsor)
+                .layer(middleware::from_fn(outbound_route_timeout)),
+        )
         .route(
             "/v1/wallets/:id/sponsored-transactions",
             get(routes::sponsor::list_sponsored_transactions),
@@ -372,6 +422,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/wallets/:id/payment-links/:link_id/payments",
             get(routes::payment_links::list_payment_link_payments),
         )
+        .route(
+            "/v1/wallets/:id/payment-links/:link_id/cancel",
+            post(routes::payment_links::cancel_payment_link),
+        )
         // Public: no auth, reachable by anyone with the link.
         .route(
             "/v1/pay/:slug",
@@ -398,6 +452,7 @@ pub fn build_router(state: AppState) -> Router {
         // needed. tower_http's RequestBodyLimitLayer would require one and does not compose
         // cleanly with `Router::layer` here.
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
+        .layer(middleware::from_fn(error_envelope_middleware))
         // Innermost of the middleware below, so it sees the MatchedPath set by routing.
         .layer(middleware::from_fn(http_metrics_middleware))
         .layer(cors)

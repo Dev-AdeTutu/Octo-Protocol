@@ -683,3 +683,48 @@ async fn invariant_failed_payment_from_horizon_creates_no_deposit_row() {
         Some(failed.paging_token.as_str())
     );
 }
+
+#[tokio::test]
+async fn deposit_after_link_expiry_is_recorded_but_not_matched() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    // The intent was opened while the link was live; the deadline passed before funds landed.
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let (muxed, link_id, intent_id) =
+        make_usdc_payment_link_expiring(&store, wallet_id, 100_000_000, Some(past)).await;
+    let rec = usdc_record("op-late-expired-1", muxed, "10.0000000");
+
+    let outcome = ingestor.process(&rec).await.unwrap();
+    assert_eq!(outcome, Processed::Recorded { attributed: true });
+
+    let payment = store
+        .get_payment_link_payment(link_id, intent_id)
+        .await
+        .unwrap();
+    assert_eq!(payment.status, "pending", "a late deposit must not confirm the intent");
+    assert!(payment.transaction_id.is_none());
+}
+
+#[tokio::test]
+async fn deposit_after_link_cancel_is_recorded_but_not_matched() {
+    let Some((store, ingestor, wallet_id)) = setup().await else {
+        return;
+    };
+
+    let (muxed, link_id, intent_id) = make_usdc_payment_link(&store, wallet_id, 100_000_000).await;
+    let (_, cancelled) = store.cancel_payment_link(wallet_id, link_id).await.unwrap();
+    assert_eq!(cancelled.len(), 1);
+    let rec = usdc_record("op-late-cancelled-1", muxed, "10.0000000");
+
+    let outcome = ingestor.process(&rec).await.unwrap();
+    assert_eq!(outcome, Processed::Recorded { attributed: true });
+
+    let payment = store
+        .get_payment_link_payment(link_id, intent_id)
+        .await
+        .unwrap();
+    assert_eq!(payment.status, "cancelled");
+    assert!(payment.transaction_id.is_none());
+}

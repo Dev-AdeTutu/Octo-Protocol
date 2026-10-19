@@ -1782,8 +1782,9 @@ impl Store {
         let row = sqlx::query_as::<_, PaymentLink>(
             r#"
             INSERT INTO payment_links
-                (wallet_id, address_id, slug, name, description, image_url, redirect_url, amount_usdc_stroops)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (wallet_id, address_id, slug, name, description, image_url, redirect_url,
+                 amount_usdc_stroops, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *
             "#,
         )
@@ -1795,6 +1796,7 @@ impl Store {
         .bind(link.image_url)
         .bind(link.redirect_url)
         .bind(link.amount_usdc_stroops)
+        .bind(link.expires_at)
         .fetch_one(&self.pool)
         .await
         .map_err(StoreError::from_sqlx_conflict)?;
@@ -1877,16 +1879,18 @@ impl Store {
         Ok(rows)
     }
 
+    /// Toggle a link's `active` flag. Returns `Conflict` when re-activating a cancelled link (#454).
     pub async fn set_payment_link_active(
         &self,
         wallet_id: Uuid,
         id: Uuid,
         active: bool,
     ) -> Result<PaymentLink, StoreError> {
-        sqlx::query_as::<_, PaymentLink>(
+        let updated = sqlx::query_as::<_, PaymentLink>(
             r#"
             UPDATE payment_links SET active = $1, updated_at = now()
             WHERE id = $2 AND wallet_id = $3
+              AND (cancelled_at IS NULL OR NOT $1)
             RETURNING *
             "#,
         )
@@ -1894,8 +1898,53 @@ impl Store {
         .bind(id)
         .bind(wallet_id)
         .fetch_optional(&self.pool)
+        .await?;
+
+        match updated {
+            Some(link) => Ok(link),
+            // No row: either it isn't this wallet's link, or it is cancelled.
+            None => {
+                self.get_payment_link(wallet_id, id).await?;
+                Err(StoreError::Conflict)
+            }
+        }
+    }
+
+    /// Permanently cancel a link and flip its pending intents to `cancelled`, atomically (#454).
+    ///
+    /// Idempotent: a second call keeps the original `cancelled_at` and returns no intents. The
+    /// intents are returned so the caller can notify once per cancelled payment.
+    pub async fn cancel_payment_link(
+        &self,
+        wallet_id: Uuid,
+        id: Uuid,
+    ) -> Result<(PaymentLink, Vec<PaymentLinkPayment>), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let link = sqlx::query_as::<_, PaymentLink>(
+            r#"
+            UPDATE payment_links
+            SET cancelled_at = COALESCE(cancelled_at, now()), active = false, updated_at = now()
+            WHERE id = $1 AND wallet_id = $2
+            RETURNING *
+            "#,
+        )
+        .bind(id)
+        .bind(wallet_id)
+        .fetch_optional(&mut *tx)
         .await?
-        .ok_or(StoreError::NotFound)
+        .ok_or(StoreError::NotFound)?;
+        let cancelled = sqlx::query_as::<_, PaymentLinkPayment>(
+            r#"
+            UPDATE payment_link_payments SET status = 'cancelled'
+            WHERE payment_link_id = $1 AND status = 'pending'
+            RETURNING *
+            "#,
+        )
+        .bind(link.id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((link, cancelled))
     }
 
     /// Apply owner edits to a payment link that has not been paid (#455).
@@ -2027,23 +2076,25 @@ impl Store {
         Ok(row)
     }
 
+    /// Confirm a still-`pending` payment. Returns `false` if it was already settled, expired or
+    /// cancelled, so a late or replayed deposit can never resurrect it.
     pub async fn confirm_payment_link_payment(
         &self,
         id: Uuid,
         transaction_id: Uuid,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
+    ) -> Result<bool, StoreError> {
+        let res = sqlx::query(
             r#"
             UPDATE payment_link_payments
             SET status = 'confirmed', transaction_id = $1
-            WHERE id = $2
+            WHERE id = $2 AND status = 'pending'
             "#,
         )
         .bind(transaction_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() == 1)
     }
 
     /// Record a deposit that landed on this payment's address but for the wrong amount.
@@ -2055,12 +2106,12 @@ impl Store {
         id: Uuid,
         transaction_id: Uuid,
         status: &str,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
+    ) -> Result<bool, StoreError> {
+        let res = sqlx::query(
             r#"
             UPDATE payment_link_payments
             SET status = $1, transaction_id = $2
-            WHERE id = $3
+            WHERE id = $3 AND status = 'pending'
             "#,
         )
         .bind(status)
@@ -2068,20 +2119,28 @@ impl Store {
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() == 1)
     }
 
-    /// Mark payments still `pending` past a 1-hour deadline as `expired`, returning the rows that
-    /// were flipped so the caller can fire one webhook per expiry without a second query.
+    /// Mark payments still `pending` past their 1-hour deadline, or whose link's `expires_at` has
+    /// passed (#454), as `expired`, returning the flipped rows so the caller can fire one webhook
+    /// per expiry without a second query.
     pub async fn expire_stale_payment_link_payments(
         &self,
     ) -> Result<Vec<PaymentLinkPayment>, StoreError> {
         let rows = sqlx::query_as::<_, PaymentLinkPayment>(
             r#"
-            UPDATE payment_link_payments
+            UPDATE payment_link_payments p
             SET status = 'expired'
-            WHERE status = 'pending' AND created_at < now() - interval '1 hour'
-            RETURNING *
+            WHERE p.status = 'pending'
+              AND (
+                  p.created_at < now() - interval '1 hour'
+                  OR EXISTS (
+                      SELECT 1 FROM payment_links l
+                      WHERE l.id = p.payment_link_id AND l.expires_at <= now()
+                  )
+              )
+            RETURNING p.*
             "#,
         )
         .fetch_all(&self.pool)
@@ -2230,6 +2289,32 @@ impl Store {
             // Unique violation on inner_tx_hash => already sponsored.
             Err(e) => Err(StoreError::from_sqlx_conflict(e)),
         }
+    }
+
+    /// Read-only sponsorship projection for the dry-run endpoint (#463): today's spend counted
+    /// exactly as [`Store::try_reserve_sponsored_transaction`] counts it, and whether
+    /// `inner_tx_hash` was already sponsored. Takes no lock and writes nothing.
+    pub async fn sponsorship_projection(
+        &self,
+        wallet_id: Uuid,
+        inner_tx_hash: &str,
+    ) -> Result<(i64, bool), StoreError> {
+        let row: (i64, bool) = sqlx::query_as(
+            r#"
+            SELECT
+                (SELECT COALESCE(SUM(fee_stroops), 0)::bigint
+                 FROM sponsored_transactions
+                 WHERE wallet_id = $1
+                   AND status IN ('pending', 'confirmed')
+                   AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')),
+                EXISTS (SELECT 1 FROM sponsored_transactions WHERE inner_tx_hash = $2)
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(inner_tx_hash)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// Update a sponsored transaction's outcome after submission.

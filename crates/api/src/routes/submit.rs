@@ -11,7 +11,7 @@ use crate::json::parse_optional;
 use crate::state::AppState;
 use crate::submit_validation::validate_signed_xdr;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use octo_wallet_core::compute_inner_tx_hash;
@@ -491,6 +491,60 @@ pub struct SigningInfo {
     pub base_fee_stroops: i64,
     /// Absolute UNIX timestamp in seconds for the transaction time-bound `max_time`.
     pub max_time: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct WithdrawEstimateParams {
+    /// Credit asset code; omit for native XLM.
+    pub asset_code: Option<String>,
+    /// Required with `asset_code`.
+    pub asset_issuer: Option<String>,
+    /// Optional amount to check against the withdrawable maximum.
+    pub amount_stroops: Option<i64>,
+    /// Operations in the transaction to be built (default 1).
+    pub operations: Option<i64>,
+}
+
+/// `GET /v1/wallets/:id/withdraw/estimate` — preview the fee and minimum-balance impact of a
+/// withdrawal before building it (#464). Read-only: one account read plus cached fee stats.
+pub async fn withdraw_estimate(
+    State(state): State<AppState>,
+    Path(wallet_id): Path<Uuid>,
+    headers: HeaderMap,
+    Query(q): Query<WithdrawEstimateParams>,
+) -> ApiResult<Json<Envelope<crate::withdrawal_estimate::WithdrawalEstimate>>> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+    let asset = match (q.asset_code.filter(|c| !c.is_empty()), q.asset_issuer) {
+        (None, _) => None,
+        (Some(code), Some(issuer)) if !issuer.is_empty() => Some((code, issuer)),
+        (Some(_), _) => {
+            return Err(ApiError::BadRequest(
+                "asset_issuer is required with asset_code".into(),
+            ))
+        }
+    };
+    let req = crate::withdrawal_estimate::EstimateRequest {
+        asset,
+        amount_stroops: q.amount_stroops,
+        operations: q.operations.unwrap_or(1),
+    };
+
+    let wallet = state.store().get_wallet(wallet_id).await?;
+    let info = state
+        .horizon()
+        .account_info(&wallet.stellar_account_g)
+        .await
+        .map_err(|e| match e {
+            ApiError::NotFound => ApiError::BadRequest(
+                "This wallet is not funded on-chain yet. Fund it with XLM (testnet friendbot) first."
+                    .into(),
+            ),
+            other => other,
+        })?;
+    let fees = state.horizon().fee_stats().await?;
+    Ok(Envelope::ok(crate::withdrawal_estimate::estimate(
+        &info, fees, &req,
+    )?))
 }
 
 const WITHDRAW_CONFIRM_RATE_LIMIT_THRESHOLD: u32 = 10;
