@@ -89,8 +89,12 @@ pub async fn sponsor(
         }
     }
 
-    // 3. Validate the inner XDR (op allowlist + no self-sponsorship). Pure, no I/O.
-    validate_inner_xdr(&inner_xdr, &wallet.stellar_account_g)?;
+    // 3. Validate the inner XDR (global + per-wallet op allowlist, no self-sponsorship) before signing.
+    validate_inner_xdr(
+        &inner_xdr,
+        &wallet.stellar_account_g,
+        config.allowed_operations.as_deref(),
+    )?;
 
     // Pre-flight sequence check to save a wasted budget reservation and signature on a doomed submission.
     let live_seq = state

@@ -102,7 +102,13 @@ carries fee float only — the one server-held key in the system, bounded by you
 - `POST /v1/wallets/{id}/gas-tank` — provision the gas tank. **Dashboard JWT only** (an API key
   gets `401`). Idempotent: a second call returns the existing tank.
 - `GET  /v1/wallets/{id}/sponsorship` / `PUT` — read/update `enabled`, the per-transaction fee
-  cap, and the daily budget.
+  cap, the daily budget, and `allowed_operations`. `allowed_operations` narrows the global
+  sponsorship allowlist (`Payment`, `PathPaymentStrictSend`, `PathPaymentStrictReceive`) for this
+  wallet: send a non-empty subset to restrict, `null` to inherit the global list, or omit it to
+  keep the current setting. Anything outside the global list is `400`. The response also reports
+  `effective_allowed_operations`.
+- `POST /v1/wallets/{id}/sponsor` rejects (`400 op_not_allowed`) any operation outside the
+  wallet's effective allowlist before anything is signed.
 - `POST /v1/wallets/{id}/sponsor` — fee-bump a user's **already-signed** inner transaction.
   The gas tank signs only the outer fee-bump envelope; the inner transaction is passed through
   untouched. Over budget → `429`; duplicate inner tx → `409`.

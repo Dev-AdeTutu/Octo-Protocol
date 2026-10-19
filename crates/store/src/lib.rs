@@ -1356,22 +1356,30 @@ impl Store {
     }
 
     /// Create or replace a wallet's sponsorship config.
+    ///
+    /// `allowed_operations`: `None` keeps the stored list, `Some(None)` resets to the global
+    /// allowlist, `Some(Some(list))` stores `list`. Kept-by-default so an unrelated update can
+    /// never silently widen a wallet back to the global set.
     pub async fn upsert_gas_sponsorship_config(
         &self,
         wallet_id: Uuid,
         enabled: bool,
         per_tx_fee_cap_stroops: Option<i64>,
         daily_budget_stroops: Option<i64>,
+        allowed_operations: Option<Option<&[String]>>,
     ) -> Result<GasSponsorshipConfig, StoreError> {
         sqlx::query_as::<_, GasSponsorshipConfig>(
             r#"
             INSERT INTO gas_sponsorship_configs
-                (wallet_id, enabled, per_tx_fee_cap_stroops, daily_budget_stroops)
-            VALUES ($1, $2, $3, $4)
+                (wallet_id, enabled, per_tx_fee_cap_stroops, daily_budget_stroops,
+                 allowed_operations)
+            VALUES ($1, $2, $3, $4, $6)
             ON CONFLICT (wallet_id) DO UPDATE SET
                 enabled = EXCLUDED.enabled,
                 per_tx_fee_cap_stroops = EXCLUDED.per_tx_fee_cap_stroops,
                 daily_budget_stroops = EXCLUDED.daily_budget_stroops,
+                allowed_operations = CASE WHEN $5 THEN EXCLUDED.allowed_operations
+                                          ELSE gas_sponsorship_configs.allowed_operations END,
                 updated_at = now()
             RETURNING *
             "#,
@@ -1380,6 +1388,8 @@ impl Store {
         .bind(enabled)
         .bind(per_tx_fee_cap_stroops)
         .bind(daily_budget_stroops)
+        .bind(allowed_operations.is_some())
+        .bind(allowed_operations.flatten())
         .fetch_one(&self.pool)
         .await
         .map_err(StoreError::Database)

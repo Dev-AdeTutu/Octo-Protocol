@@ -940,7 +940,7 @@ async fn upsert_gas_sponsorship_config_works() {
     let Some(store) = store().await else { return };
     let wallet_id = fresh_wallet(&store).await;
     let cfg = store
-        .upsert_gas_sponsorship_config(wallet_id, true, Some(500_000), Some(10_000_000))
+        .upsert_gas_sponsorship_config(wallet_id, true, Some(500_000), Some(10_000_000), None)
         .await
         .expect("upsert");
     assert!(cfg.enabled);
@@ -949,6 +949,32 @@ async fn upsert_gas_sponsorship_config_works() {
         .await
         .expect("sum");
     assert_eq!(spent, 0);
+}
+
+#[tokio::test]
+async fn sponsorship_allowed_operations_persist_until_explicitly_reset() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let payments = vec!["Payment".to_string()];
+
+    let cfg = store
+        .upsert_gas_sponsorship_config(wallet_id, true, None, None, Some(Some(&payments[..])))
+        .await
+        .expect("set list");
+    assert_eq!(cfg.allowed_operations.as_deref(), Some(&payments[..]));
+
+    // An update that omits the list must not widen the wallet back to the global set.
+    let cfg = store
+        .upsert_gas_sponsorship_config(wallet_id, false, Some(1_000), None, None)
+        .await
+        .expect("unrelated update");
+    assert_eq!(cfg.allowed_operations.as_deref(), Some(&payments[..]));
+
+    let cfg = store
+        .upsert_gas_sponsorship_config(wallet_id, true, None, None, Some(None))
+        .await
+        .expect("reset");
+    assert_eq!(cfg.allowed_operations, None);
 }
 
 /// Create a throwaway user with a unique email (so tests don't collide).
